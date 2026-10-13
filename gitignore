@@ -27,3 +27,7 @@ Thumbs.db
 *.temp
 
 data/
+
+# Local DuckDB data
+/data/*.duckdb
+/data/*.duckdb.wal
