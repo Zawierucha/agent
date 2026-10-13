@@ -1,99 +1,29 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
 
 import json
 import sys
-from dataclasses import asdict, dataclass
 from typing import Any
 
 import click
 import requests
 
 
-NCBI_EUTILS_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-
-DEFAULT_TIMEOUT = 30.0
-
-IBD_QUERIES = [
-    "inflammatory bowel disease",
-    "IBD",
-    "Crohn disease",
-    "Crohn's disease",
-    "ulcerative colitis",
-    "ulcerative colitis single cell",
-    "Crohn disease single cell",
-    "inflammatory bowel disease single cell",
-]
+ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 
 
-@dataclass
-class GEOCandidate:
-    """Candidate GEO Series dataset."""
-
-    gse_id: str
-    accession: str
-    title: str | None
-    summary: str | None
-    organism: str | None
-    source: str = "NCBI GEO"
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert the candidate to a dictionary."""
-        return asdict(self)
-
-
-def _get(
-    endpoint: str,
-    params: dict[str, Any],
-    *,
-    timeout: float,
-) -> requests.Response:
-    """Perform an HTTP GET request against NCBI E-utilities."""
-
-    response = requests.get(
-        f"{NCBI_EUTILS_URL}/{endpoint}",
-        params=params,
-        timeout=timeout,
-        headers={
-            "User-Agent": "sc-dataset-search/0.1.0",
-        },
-    )
-
-    response.raise_for_status()
-
-    return response
-
-
-def search_geo(
+def _search_geo_ids(
     query: str,
     *,
-    max_results: int = 100,
-    timeout: float = DEFAULT_TIMEOUT,
-) -> list[dict[str, Any]]:
-    """
-    Search NCBI GEO for a single query.
+    max_results: int,
+    timeout: float,
+    session: requests.Session,
+) -> list[str]:
+    """Search NCBI GEO and return GEO record IDs."""
 
-    Parameters
-    ----------
-    query:
-        NCBI GEO search query.
-
-    max_results:
-        Maximum number of GEO records to retrieve.
-
-    timeout:
-        HTTP request timeout in seconds.
-
-    Returns
-    -------
-    list[dict[str, Any]]
-        GEO candidate datasets.
-    """
-
-    response = _get(
-        "esearch.fcgi",
-        {
+    response = session.get(
+        ESEARCH_URL,
+        params={
             "db": "gds",
             "term": query,
             "retmax": max_results,
@@ -101,134 +31,201 @@ def search_geo(
         },
         timeout=timeout,
     )
+    response.raise_for_status()
 
-    payload = response.json()
+    data = response.json()
 
-    search_result = payload.get("esearchresult", {})
-    ids = search_result.get("idlist", [])
-
-    if not ids:
-        return []
-
-    return _fetch_geo_records(
-        ids,
-        timeout=timeout,
-    )
+    return data["esearchresult"]["idlist"]
 
 
 def _fetch_geo_records(
     ids: list[str],
     *,
     timeout: float,
+    session: requests.Session,
 ) -> list[dict[str, Any]]:
-    """
-    Retrieve GEO metadata for GEO database IDs.
+    """Fetch GEO summaries for NCBI GEO record IDs."""
 
-    The GEO `gds` database contains several record types.
-    Only GSE accessions are retained.
-    """
+    if not ids:
+        return []
 
-    response = _get(
-        "esummary.fcgi",
-        {
+    response = session.get(
+        ESUMMARY_URL,
+        params={
             "db": "gds",
             "id": ",".join(ids),
             "retmode": "json",
         },
         timeout=timeout,
     )
+    response.raise_for_status()
 
-    payload = response.json()
-    records = payload.get("result", {})
+    data = response.json()
+    result = data["result"]
 
-    candidates: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
 
-    for geo_id in ids:
-        record = records.get(geo_id)
+    for record_id in result.get("uids", []):
+        record = result.get(record_id)
 
         if not isinstance(record, dict):
             continue
 
-        accession = record.get("accession")
+        records.append(record)
 
-        if not accession:
+    return records
+
+
+def _extract_gse(record: dict[str, Any]) -> str | None:
+    """Extract a GSE accession from a GEO summary record."""
+
+    accession = record.get("accession")
+
+    if isinstance(accession, str) and accession.startswith("GSE"):
+        return accession
+
+    title = record.get("title")
+
+    if isinstance(title, str):
+        for token in title.split():
+            if token.startswith("GSE") and token[3:].isdigit():
+                return token.rstrip(",.;:)")
+
+    return None
+
+
+def _normalize_record(
+    record: dict[str, Any],
+    *,
+    query: str,
+) -> dict[str, Any]:
+    """Convert an NCBI GEO record into the tool output schema."""
+
+    gse_id = _extract_gse(record)
+
+    return {
+        "gse_id": gse_id,
+        "title": record.get("title"),
+        "summary": record.get("summary"),
+        "taxon": record.get("taxon"),
+        "gds_type": record.get("gdstype"),
+        "organism": record.get("organism"),
+        "platform": record.get("gpl"),
+        "n_samples": record.get("n_samples"),
+        "query": query,
+    }
+
+
+def _deduplicate_gses(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Deduplicate GEO records by GSE accession."""
+
+    deduplicated: dict[str, dict[str, Any]] = {}
+
+    for record in records:
+        gse_id = record.get("gse_id")
+
+        if not gse_id:
             continue
 
-        if not accession.startswith("GSE"):
+        if gse_id not in deduplicated:
+            deduplicated[gse_id] = record
             continue
 
-        candidate = GEOCandidate(
-            gse_id=accession,
-            accession=accession,
-            title=record.get("title"),
-            summary=record.get("summary"),
-            organism=record.get("taxon"),
-        )
+        # Preserve the query that discovered the GSE.
+        existing = deduplicated[gse_id]
 
-        candidates.append(candidate.to_dict())
+        existing_query = existing.get("query")
+        new_query = record.get("query")
 
-    return candidates
+        if existing_query and new_query and new_query != existing_query:
+            existing["query"] = f"{existing_query}; {new_query}"
+
+    return list(deduplicated.values())
 
 
-def search_ibd_sc_datasets(
+def search_geo(
+    queries: list[str],
     *,
     max_results_per_query: int = 100,
-    timeout: float = DEFAULT_TIMEOUT,
+    timeout: float = 30.0,
 ) -> list[dict[str, Any]]:
-    """
-    Search GEO using the complete IBD candidate-discovery strategy.
+    """Search NCBI GEO using arbitrary queries.
 
-    Each query is executed independently and duplicate GSE accessions
-    are merged.
-
-    This function performs candidate discovery only. It does not
-    determine whether a dataset is truly related to IBD or whether
-    it contains single-cell RNA-seq data.
+    This function contains no domain-specific search terminology.
+    The caller is responsible for constructing the queries.
     """
 
-    datasets: dict[str, dict[str, Any]] = {}
+    if not queries:
+        return []
 
-    for query in IBD_QUERIES:
-        candidates = search_geo(
-            query,
-            max_results=max_results_per_query,
-            timeout=timeout,
+    cleaned_queries = list(
+        dict.fromkeys(
+            query.strip()
+            for query in queries
+            if isinstance(query, str) and query.strip()
+        )
+    )
+
+    if not cleaned_queries:
+        return []
+
+    all_records: list[dict[str, Any]] = []
+
+    with requests.Session() as session:
+        session.headers.update(
+            {
+                "User-Agent": "hermes-work/sc-dataset-search",
+            }
         )
 
-        for candidate in candidates:
-            gse_id = candidate["gse_id"]
+        for query in cleaned_queries:
+            ids = _search_geo_ids(
+                query,
+                max_results=max_results_per_query,
+                timeout=timeout,
+                session=session,
+            )
 
-            if gse_id not in datasets:
-                datasets[gse_id] = candidate
+            records = _fetch_geo_records(
+                ids,
+                timeout=timeout,
+                session=session,
+            )
 
-    return list(datasets.values())
+            all_records.extend(
+                _normalize_record(
+                    record,
+                    query=query,
+                )
+                for record in records
+            )
+
+    return _deduplicate_gses(all_records)
 
 
 @click.command()
 @click.option(
     "--query",
-    type=str,
-    default=None,
-    help="Run one custom GEO query.",
-)
-@click.option(
-    "--ibd",
-    is_flag=True,
-    help="Run the complete IBD search strategy.",
+    "queries",
+    multiple=True,
+    required=True,
+    help="GEO search query. Can be specified multiple times.",
 )
 @click.option(
     "--max-results",
-    type=click.IntRange(min=1),
     default=100,
     show_default=True,
+    type=click.IntRange(min=1),
     help="Maximum number of results per query.",
 )
 @click.option(
     "--timeout",
-    type=click.FloatRange(min=0.1),
-    default=DEFAULT_TIMEOUT,
+    default=30.0,
     show_default=True,
-    help="HTTP timeout in seconds.",
+    type=float,
+    help="HTTP request timeout in seconds.",
 )
 @click.option(
     "--pretty",
@@ -236,46 +233,18 @@ def search_ibd_sc_datasets(
     help="Pretty-print JSON output.",
 )
 def main(
-    query: str | None,
-    ibd: bool,
+    queries: tuple[str, ...],
     max_results: int,
     timeout: float,
     pretty: bool,
 ) -> None:
-    """Search NCBI GEO for candidate IBD single-cell datasets."""
+    """Search NCBI GEO using arbitrary search queries."""
 
-    if not query and not ibd:
-        raise click.UsageError(
-            "Specify either --query or --ibd."
-        )
-
-    if query and ibd:
-        raise click.UsageError(
-            "Specify either --query or --ibd, not both."
-        )
-
-    try:
-        if query:
-            results = search_geo(
-                query,
-                max_results=max_results,
-                timeout=timeout,
-            )
-        else:
-            results = search_ibd_sc_datasets(
-                max_results_per_query=max_results,
-                timeout=timeout,
-            )
-
-    except requests.RequestException as exc:
-        raise click.ClickException(
-            f"NCBI GEO request failed: {exc}"
-        ) from exc
-
-    except ValueError as exc:
-        raise click.ClickException(
-            f"Invalid response from NCBI GEO: {exc}"
-        ) from exc
+    results = search_geo(
+        list(queries),
+        max_results_per_query=max_results,
+        timeout=timeout,
+    )
 
     if pretty:
         click.echo(
