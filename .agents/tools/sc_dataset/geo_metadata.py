@@ -1,269 +1,280 @@
-from __future__ import annotations
-
+import gzip
 import json
+import re
 from typing import Any
 
 import click
 import requests
 
-
-ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+GEO_FTP_URL = "https://ftp.ncbi.nlm.nih.gov/geo/series"
 
 
-def _request_json(
-    session: requests.Session,
-    url: str,
-    *,
-    params: dict[str, Any],
-    timeout: float,
-) -> dict[str, Any]:
-    response = session.get(
+def _request_text(url: str, timeout: float) -> str:
+    response = requests.get(
         url,
-        params=params,
+        headers={"User-Agent": "hermes-work/sc-dataset-qualification"},
         timeout=timeout,
     )
     response.raise_for_status()
-    return response.json()
+    return response.text
 
 
-def _find_geo_id(
-    accession: str,
-    *,
-    timeout: float,
-    session: requests.Session,
-) -> str:
-    """Resolve a GEO accession to an NCBI GEO UID."""
-
-    data = _request_json(
-        session,
-        ESEARCH_URL,
-        params={
-            "db": "gds",
-            "term": f"{accession}[Accession]",
-            "retmax": 1,
-            "retmode": "json",
-        },
+def _request_bytes(url: str, timeout: float) -> bytes:
+    response = requests.get(
+        url,
+        headers={"User-Agent": "hermes-work/sc-dataset-qualification"},
         timeout=timeout,
     )
-
-    ids = data.get("esearchresult", {}).get("idlist", [])
-
-    if not ids:
-        raise ValueError(f"GEO accession not found: {accession}")
-
-    return ids[0]
+    response.raise_for_status()
+    return response.content
 
 
-def _fetch_summary(
-    geo_id: str,
-    *,
-    timeout: float,
-    session: requests.Session,
-) -> dict[str, Any]:
-    """Fetch a GEO summary record."""
+def _get_soft_url(accession: str) -> str:
+    match = re.fullmatch(r"GSE(\d+)", accession.upper())
+    if not match:
+        raise ValueError(f"Invalid GEO Series accession: {accession}")
 
-    data = _request_json(
-        session,
-        ESUMMARY_URL,
-        params={
-            "db": "gds",
-            "id": geo_id,
-            "retmode": "json",
-        },
-        timeout=timeout,
+    digits = match.group(1)
+    if len(digits) < 3:
+        raise ValueError(f"Invalid GEO Series accession: {accession}")
+
+    series_accession = f"GSE{digits}"
+    series_bucket = f"GSE{digits[:3]}nnn"
+
+    return (
+        f"{GEO_FTP_URL}/{series_bucket}/{series_accession}"
+        f"/soft/{series_accession}_family.soft.gz"
     )
 
-    result = data.get("result", {})
 
-    record = result.get(geo_id)
-
-    if not isinstance(record, dict):
-        raise ValueError(
-            f"No GEO summary returned for GEO ID: {geo_id}"
-        )
-
-    return record
+def _parse_soft_value(value: str) -> str:
+    return value.strip().strip('"')
 
 
-def _extract_gsm_ids(record: dict[str, Any]) -> list[str]:
-    """Extract GSM accessions from a GEO summary record."""
+def _parse_characteristics(values: list[str]) -> dict[str, Any]:
+    characteristics: dict[str, Any] = {}
 
-    raw_samples = record.get("samples")
-
-    if not raw_samples:
-        return []
-
-    if isinstance(raw_samples, list):
-        return [
-            sample
-            for sample in raw_samples
-            if isinstance(sample, str)
-            and sample.startswith("GSM")
-        ]
-
-    return []
-
-
-def _normalize_series(
-    record: dict[str, Any],
-    accession: str,
-) -> dict[str, Any]:
-    """Normalize a GEO Series summary."""
-
-    return {
-        "gse_id": accession,
-        "title": record.get("title"),
-        "summary": record.get("summary"),
-        "overall_design": record.get("overall_design"),
-        "organism": record.get("organism"),
-        "taxon": record.get("taxon"),
-        "platform": record.get("gpl"),
-        "n_samples": record.get("n_samples"),
-        "samples": _extract_gsm_ids(record),
-    }
-
-
-def _normalize_sample(
-    record: dict[str, Any],
-    accession: str,
-) -> dict[str, Any]:
-    """Normalize a GEO sample summary."""
-
-    return {
-        "gsm_id": accession,
-        "title": record.get("title"),
-        "summary": record.get("summary"),
-        "source_name": record.get("source_name"),
-        "organism": record.get("organism"),
-        "characteristics": record.get("characteristics"),
-        "platform": record.get("gpl"),
-    }
-
-
-def _fetch_sample_summaries(
-    gsm_ids: list[str],
-    *,
-    timeout: float,
-    session: requests.Session,
-) -> list[dict[str, Any]]:
-    """Fetch GSM summaries."""
-
-    if not gsm_ids:
-        return []
-
-    data = _request_json(
-        session,
-        ESUMMARY_URL,
-        params={
-            "db": "gds",
-            "id": ",".join(gsm_ids),
-            "retmode": "json",
-        },
-        timeout=timeout,
-    )
-
-    result = data.get("result", {})
-
-    samples: list[dict[str, Any]] = []
-
-    for gsm_id in gsm_ids:
-        record = result.get(gsm_id)
-
-        if not isinstance(record, dict):
+    for value in values:
+        value = _parse_soft_value(value)
+        if not value:
             continue
 
-        samples.append(
-            _normalize_sample(
-                record,
-                gsm_id,
+        if ":" in value:
+            key, item_value = value.split(":", 1)
+            key = key.strip()
+            item_value = item_value.strip()
+
+            if key in characteristics:
+                existing = characteristics[key]
+                if isinstance(existing, list):
+                    existing.append(item_value)
+                else:
+                    characteristics[key] = [existing, item_value]
+            else:
+                characteristics[key] = item_value
+        else:
+            characteristics.setdefault("unparsed", []).append(value)
+
+    return characteristics
+
+
+def _normalize_sample(sample: dict[str, Any]) -> dict[str, Any]:
+    characteristics = _parse_characteristics(sample.get("characteristics", []))
+
+    for key, value in characteristics.items():
+        if isinstance(value, list):
+            characteristics[key] = value
+
+    return {
+        "gsm_id": sample.get("gsm_id"),
+        "title": sample.get("title"),
+        "summary": " ".join(sample.get("summary", [])) or None,
+        "source_name": " ".join(sample.get("source_name", [])) or None,
+        "organism": " ".join(sample.get("organism", [])) or None,
+        "characteristics": characteristics,
+        "platform": sample.get("platform"),
+    }
+
+
+def _parse_soft(text: str, accession: str) -> dict[str, Any]:
+    series: dict[str, Any] = {
+        "gse_id": accession,
+        "title": None,
+        "summary": [],
+        "overall_design": [],
+        "organism": [],
+        "taxon": None,
+        "platform": None,
+        "n_samples": 0,
+    }
+
+    samples: list[dict[str, Any]] = []
+    current_sample: dict[str, Any] | None = None
+    current_section: str | None = None
+
+    series_sample_ids: list[str] = []
+
+    series_fields = {
+        "!Series_title": "title",
+        "!Series_summary": "summary",
+        "!Series_overall_design": "overall_design",
+        "!Series_organism": "organism",
+        "!Series_platform_id": "platform",
+        "!Series_sample_id": "sample_id",
+    }
+
+    sample_fields = {
+        "!Sample_title": "title",
+        "!Sample_summary": "summary",
+        "!Sample_source_name_ch1": "source_name",
+        "!Sample_organism_ch1": "organism",
+        "!Sample_characteristics_ch1": "characteristics",
+        "!Sample_platform_id": "platform",
+    }
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("^SERIES = "):
+            current_section = "series"
+            current_sample = None
+            continue
+
+        if line.startswith("^SAMPLE = "):
+            current_section = "sample"
+            gsm_id = line.split("=", 1)[1].strip()
+            current_sample = {
+                "gsm_id": gsm_id,
+                "title": None,
+                "summary": [],
+                "source_name": [],
+                "organism": [],
+                "characteristics": [],
+                "platform": None,
+            }
+            samples.append(current_sample)
+            continue
+
+        if line.startswith("^"):
+            current_section = None
+            current_sample = None
+            continue
+
+        if not line.startswith("!"):
+            continue
+
+        if current_section == "series":
+            matched_key = next(
+                (key for key in series_fields if line.startswith(f"{key} = ")),
+                None,
             )
+            if matched_key is None:
+                continue
+
+            value = _parse_soft_value(line.split("=", 1)[1])
+            field = series_fields[matched_key]
+
+            if field == "sample_id":
+                if value.startswith("GSM"):
+                    series_sample_ids.append(value)
+            elif field in {"summary", "overall_design", "organism"}:
+                series[field].append(value)
+            else:
+                series[field] = value
+
+        elif current_section == "sample" and current_sample is not None:
+            matched_key = next(
+                (key for key in sample_fields if line.startswith(f"{key} = ")),
+                None,
+            )
+            if matched_key is None:
+                continue
+
+            value = _parse_soft_value(line.split("=", 1)[1])
+            field = sample_fields[matched_key]
+
+            if field in {
+                "summary",
+                "source_name",
+                "organism",
+                "characteristics",
+            }:
+                current_sample[field].append(value)
+            else:
+                current_sample[field] = value
+
+    if not samples:
+        raise ValueError(
+            f"No GSM sample records were found in GEO SOFT for {accession}"
         )
 
-    return samples
+    if series_sample_ids:
+        sample_by_id = {sample["gsm_id"]: sample for sample in samples}
+        ordered_samples = [
+            sample_by_id[gsm_id]
+            for gsm_id in series_sample_ids
+            if gsm_id in sample_by_id
+        ]
+        remaining_samples = [
+            sample
+            for sample in samples
+            if sample["gsm_id"] not in set(series_sample_ids)
+        ]
+        samples = ordered_samples + remaining_samples
+
+    series["summary"] = " ".join(series["summary"]) or None
+    series["overall_design"] = " ".join(series["overall_design"]) or None
+    series["organism"] = " ".join(series["organism"]) or None
+    series["taxon"] = series["organism"]
+    series["n_samples"] = len(samples)
+
+    if isinstance(series["platform"], str):
+        series["platform"] = series["platform"].strip() or None
+
+    normalized_samples = [_normalize_sample(sample) for sample in samples]
+
+    return {
+        "gse": series,
+        "samples": normalized_samples,
+    }
 
 
-def get_geo_metadata(
-    accession: str,
-    *,
-    timeout: float = 30.0,
-) -> dict[str, Any]:
-    """Retrieve normalized metadata for a GEO Series."""
-
+def get_geo_metadata(accession: str, timeout: float = 30.0) -> dict[str, Any]:
     accession = accession.strip().upper()
 
-    if not accession.startswith("GSE"):
+    if not re.fullmatch(r"GSE\d+", accession):
         raise ValueError(
-            f"Expected a GSE accession, got: {accession}"
+            f"Invalid GEO Series accession: {accession}. Expected GSE followed by digits."
         )
 
-    with requests.Session() as session:
-        session.headers.update(
-            {
-                "User-Agent": "hermes-work/sc-dataset-qualification",
-            }
-        )
+    url = _get_soft_url(accession)
+    content = _request_bytes(url, timeout)
 
-        geo_id = _find_geo_id(
-            accession,
-            timeout=timeout,
-            session=session,
-        )
+    try:
+        soft_text = gzip.decompress(content).decode("utf-8", errors="replace")
+    except gzip.BadGzipFile as exc:
+        raise ValueError(
+            f"GEO SOFT response for {accession} was not a valid gzip file"
+        ) from exc
 
-        series_record = _fetch_summary(
-            geo_id,
-            timeout=timeout,
-            session=session,
-        )
-
-        series = _normalize_series(
-            series_record,
-            accession,
-        )
-
-        gsm_ids = series.pop("samples")
-
-        samples = _fetch_sample_summaries(
-            gsm_ids,
-            timeout=timeout,
-            session=session,
-        )
-
-        return {
-            "gse": series,
-            "samples": samples,
-        }
+    return _parse_soft(soft_text, accession)
 
 
 @click.command()
 @click.argument("accession")
-@click.option(
-    "--timeout",
-    default=30.0,
-    show_default=True,
-    type=float,
-    help="HTTP request timeout in seconds.",
-)
-@click.option(
-    "--pretty",
-    is_flag=True,
-    help="Pretty-print JSON output.",
-)
-def main(
-    accession: str,
-    timeout: float,
-    pretty: bool,
-) -> None:
-    """Retrieve metadata for a GEO Series."""
-
-    metadata = get_geo_metadata(
-        accession,
-        timeout=timeout,
-    )
+@click.option("--timeout", default=30.0, type=float, show_default=True)
+@click.option("--pretty", is_flag=True, help="Pretty-print JSON output.")
+def main(accession: str, timeout: float, pretty: bool) -> None:
+    try:
+        result = get_geo_metadata(accession, timeout=timeout)
+    except (ValueError, requests.RequestException, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
 
     click.echo(
         json.dumps(
-            metadata,
+            result,
             indent=2 if pretty else None,
             ensure_ascii=False,
         )

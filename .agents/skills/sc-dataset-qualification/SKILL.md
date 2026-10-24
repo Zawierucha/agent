@@ -1,205 +1,122 @@
 ---
 name: sc-dataset-qualification
-description: Qualify candidate human GEO datasets for IBD single-cell analysis using GEO metadata evidence.
-version: 0.1.0
+description: Qualify human GEO single-cell and single-nucleus RNA-seq datasets for IBD research using disease, assay modality, and sample-level tissue evidence.
+version: 0.2.0
 author: Piotr Zawierucha
 license: MIT
-platforms: [linux]
+platforms:
+  - linux
 metadata:
   hermes:
-    tags: [bioinformatics, single-cell, GEO, IBD, datasets]
+    tags:
+      - bioinformatics
+      - single-cell
+      - GEO
+      - IBD
+      - qualification
     category: research
 ---
 
-# Single-Cell Dataset Qualification
+# sc-dataset-qualification
 
-Qualify candidate GEO Series identified by the
-`sc-dataset-search` skill.
+## Purpose
 
-This skill evaluates whether a candidate dataset contains
-relevant human single-cell RNA-seq data for downstream IBD
-analysis.
+Assess whether GEO datasets and their individual GSM samples are suitable for human inflammatory bowel disease (IBD) single-cell transcriptomics research.
 
-Qualification must be based on evidence retrieved from NCBI GEO.
+This skill performs qualification only. It does not discover datasets, manage the catalog, persist results, download expression matrices, or orchestrate downstream analysis.
 
-Do not invent information that is not supported by GEO metadata.
+## Qualification criteria
 
-## Goal
+### Organism
 
-For each candidate GSE determine whether it should proceed to
-the downstream pipeline.
+- Include only samples from *Homo sapiens*.
+- Exclude samples explicitly identified as non-human.
+- Mark samples as `uncertain` when the organism cannot be established from available evidence.
 
-Evaluate the following dimensions independently:
+### Disease relevance
 
-- species
-- disease relevance
-- sequencing modality
-- tissue
-- study design
-
-## Species
-
-The downstream pipeline requires human datasets.
-
-Accept:
-
-- Homo sapiens
-- Human
-
-Exclude datasets explicitly identified as another organism.
-
-For mixed-organism datasets, report the mixed species and determine
-whether human samples are actually present.
-
-If organism information is unavailable, mark it as uncertain.
-
-Do not assume an unknown organism is human.
-
-## Disease relevance
-
-Look for explicit evidence of:
-
-- inflammatory bowel disease
-- IBD
-- Crohn disease
+Relevant disease groups include:
 - Crohn's disease
-- ulcerative colitis
+- Ulcerative colitis
+- Inflammatory bowel disease (IBD)
 
-Also consider clearly related study terminology when supported by
-the metadata.
+Appropriate non-IBD controls may be included when they belong to a relevant study and meet the other criteria.
 
-Do not classify a dataset as IBD-related merely because the original
-GEO search query contained an IBD term.
+Use sample-level evidence to distinguish affected samples, unaffected tissue, and non-IBD controls where possible. Do not infer an individual sample's disease status solely from the dataset title.
 
-The classification must be supported by the dataset metadata.
+### Assay modality
 
-## Single-cell modality
+- Include single-cell RNA sequencing (scRNA-seq) and single-nucleus RNA sequencing (snRNA-seq).
+- Spatial transcriptomics alone does not establish eligibility for scRNA-seq or snRNA-seq.
+- ADT-only, protein-only, and TCR/VDJ-only data do not qualify as RNA-expression assays.
+- For multimodal datasets, assess each sample or assay separately when the evidence permits.
+- Use series-level assay descriptions when sample-level modality evidence is unavailable, and record this limitation.
 
-Determine whether the dataset contains:
+### Tissue source
 
-- single-cell RNA sequencing
-- scRNA-seq
-- single-nucleus RNA sequencing
-- snRNA-seq
+Eligible tissue must originate from the colon or a clearly identified colonic segment, including the rectum and rectal mucosa.
 
-Distinguish these from:
+- Include samples with explicit evidence of eligible colonic or rectal origin.
+- Do not include blood, PBMC, or other non-colonic tissues solely because the donor has IBD.
+- Do not assume that a sample is eligible because the dataset concerns Crohn's disease or ulcerative colitis.
+- Treat ambiguous anatomical descriptions, including `ileocolonic`, according to the available sample-level and study-design evidence. Do not infer colon involvement without supporting evidence.
+- Mark tissue as `uncertain` when the available evidence cannot establish eligible or ineligible origin.
 
-- bulk RNA-seq
-- microarray
-- other bulk transcriptomics
+## Evidence and decisions
 
-If the modality cannot be determined reliably, mark it as uncertain.
+Evaluate each GSM sample individually. Use the available series and sample metadata, including:
 
-## Tissue
+- Organism
+- Sample title and summary
+- Source name
+- Sample characteristics
+- Disease status
+- Assay modality
+- Series summary and overall design, when needed to interpret sample metadata
 
-Extract tissue information when available.
+Record the evidence supporting each decision. Distinguish explicit evidence from inference, and record missing or conflicting information.
 
-Pay particular attention to:
+Allowed decisions:
 
-- colon
-- ileum
-- small intestine
-- intestine
-- intestinal mucosa
-- intestinal tissue
-- biopsy
+- `include`: all required eligibility criteria are supported by evidence.
+- `exclude`: at least one required criterion is explicitly not met.
+- `uncertain`: evidence is insufficient or conflicting to make a reliable decision.
 
-Do not automatically exclude other tissues.
-
-Report the actual tissue evidence.
-
-## Study design
-
-Extract information relevant to downstream analysis, including when
-available:
-
-- disease state
-- healthy/control state
-- treatment
-- inflammation state
-- tissue
-- patient/sample information
-- disease subtype
-
-## Evidence
-
-Base qualification on evidence from GEO.
-
-Prefer evidence in this order:
-
-1. GEO Series title
-2. GEO Series summary
-3. GEO overall design
-4. GEO sample metadata
-5. organism/platform metadata
-
-Clearly distinguish:
-
-- observed evidence
-- interpretation
-- uncertainty
-
-Do not present an interpretation as an observed GEO fact.
-
-## Qualification
-
-Return one of:
-
-- `include`
-- `exclude`
-- `uncertain`
-
-Use `uncertain` when the available metadata does not provide enough
-evidence for a reliable decision.
-
-A dataset should generally be considered for inclusion when:
-
-- human samples are present
-- single-cell or single-nucleus transcriptomics is supported
-- IBD relevance is supported by the metadata
-
-Do not require every metadata field to be populated.
-
-## Complete sample metadata
-
-Qualify against the full Series and all GSM metadata; never inspect only a small sample subset. Verify that the retrieved GSM count equals the Series sample-reference count.
-
-If `geo_metadata.py` returns fewer GSM records than the Series declares, retrieve the NCBI GEO MINiML family archive from:
-
-```text
-https://ftp.ncbi.nlm.nih.gov/geo/series/<GSE-prefix>nnn/<GSE>/miniml/<GSE>_family.xml.tgz
-```
-
-Parse every `<Sample>` element and verify that all `<Sample-Ref>` values resolve. MINiML is authoritative for sample characteristics, protocols, assay-library distinctions, patient clues, and longitudinal timepoints.
+Do not silently convert missing evidence into eligibility.
 
 ## Output
 
-For every GSE return:
+Return a structured qualification result for the dataset and a separate result for every assessed GSM sample.
+
+Dataset-level fields:
 
 - `gse_id`
-- `qualification`
-- `is_human`
-- `is_single_cell`
-- `is_ibd_related`
-- `disease`
-- `modality`
-- `tissue`
-- `study_design`
-- `confidence`
+- `decision`
+- `organism`
+- `disease_relevance`
+- `assay_modality`
+- `eligible_tissue_evidence`
+- `included_sample_count`
+- `excluded_sample_count`
+- `uncertain_sample_count`
+- `evidence`
+- `uncertainties`
+- `exclusion_reasons`
+
+Sample-level fields:
+
+- `gsm_id`
+- `tissue_source`
+- `disease_status`
+- `modality_evidence`
+- `decision`
 - `evidence`
 - `uncertainties`
 
-Evidence should explain why the qualification was reached.
+The dataset decision must reflect the evidence and sample-level results. Do not assume that every sample in a series has the same eligibility.
 
-## Important
+## Scope boundaries
 
-This skill performs dataset-level qualification only.
+This skill is responsible only for qualification decisions and their supporting evidence.
 
-It does not:
-
-- download supplementary files
-- inspect expression matrices
-- perform QC
-- normalize expression data
-- annotate cells
-- perform differential expression
+Dataset discovery, metadata retrieval implementation, catalog operations, persistence, file downloads, and downstream expression analysis are outside its scope. Use the metadata supplied by the calling workflow and report when it is insufficient for a reliable decision.

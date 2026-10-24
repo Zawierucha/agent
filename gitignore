@@ -26,8 +26,7 @@ Thumbs.db
 *.tmp
 *.temp
 
-data/
-
 # Local DuckDB data
 /data/*.duckdb
 /data/*.duckdb.wal
+/data/schema.sql
