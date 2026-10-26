@@ -23,7 +23,7 @@ metadata:
 
 Assess whether GEO datasets and their individual GSM samples are suitable for human inflammatory bowel disease (IBD) single-cell transcriptomics research.
 
-This skill performs qualification only. It does not discover datasets, manage the catalog, persist results, download expression matrices, or orchestrate downstream analysis.
+This skill makes two independent decisions: whether the GEO series is relevant as a dataset, and whether each GSM sample is eligible. It does not classify source file formats or require a particular matrix format for biological inclusion. CSV, HDF5, 10x, and other sources remain subject to later inspection and handling.
 
 ## Qualification criteria
 
@@ -115,7 +115,11 @@ Sample-level fields:
 
 The dataset decision must reflect the evidence and sample-level results. Do not assume that every sample in a series has the same eligibility.
 
+Keep the dataset decision distinct from GSM decisions. A dataset may be `include` when series metadata establishes that it is a relevant human IBD single-cell/nucleus study even if some GSMs are excluded or uncertain. Include/exclude samples individually using their metadata. Do not downgrade a biologically relevant dataset merely because its supplementary source is CSV or another non-10x format. If the series-level assay or tissue evidence is insufficient, use `uncertain` rather than guessing.
+
 ## Scope boundaries
+
+For persistence, provide one complete sample result for every GSM registered under the GSE. Use the catalog tool's atomic dataset-plus-sample save operation; do not save the dataset aggregate while omitting GSM decisions. The tool should reject missing or duplicate GSM IDs.
 
 This skill is responsible only for qualification decisions and their supporting evidence.
 

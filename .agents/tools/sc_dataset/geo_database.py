@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 import json
+import re
 
 from pathlib import Path
 
@@ -96,6 +97,129 @@ def sample_exists(
     ).fetchone()
 
     return bool(result[0])
+
+
+_SAMPLE_METADATA_ALIASES = {
+    "disease": {
+        "disease", "disease status", "diagnosis", "diagnostic group", "condition",
+        "disease state", "subject status", "clinical diagnosis", "phenotype", "disease group",
+    },
+    "health_state": {
+        "health state", "inflammation status", "inflammatory status", "inflammatory state",
+        "tissue status", "disease activity", "activity status", "inflammation", "activity",
+    },
+    "tissue": {
+        "tissue", "tissue type", "tissue source", "sample source", "organ", "organism part",
+        "tissue cell type", "anatomical site", "anatomic site", "biopsy site", "specimen", "tissue origin",
+    },
+    "cell_type": {
+        "cell type", "cell types", "cell population", "cell subset", "cell population type",
+    },
+    "age": {"age", "age years", "age at collection", "age at biopsy", "donor age", "patient age"},
+    "sex": {"sex", "gender", "biological sex"},
+    "treatment": {"treatment", "therapy", "medication", "drug", "treatment status"},
+    "treatment_response": {
+        "treatment response", "response to treatment", "response", "responder status",
+        "response group", "therapy response",
+    },
+}
+
+
+def _metadata_key(value: str) -> str:
+    key = re.sub(r"\bch\d+\b", " ", value.casefold())
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", key).split())
+
+
+def _metadata_value(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def extract_sample_metadata(
+    characteristics: dict | list | str | None,
+    source_name: str | None = None,
+) -> dict[str, str | None]:
+    """Map explicit GEO characteristic keys to the fixed sample metadata columns."""
+    if isinstance(characteristics, str):
+        try:
+            characteristics = json.loads(characteristics)
+        except json.JSONDecodeError:
+            characteristics = {}
+    if not isinstance(characteristics, dict):
+        characteristics = {}
+
+    aliases = {
+        target: {_metadata_key(alias) for alias in names}
+        for target, names in _SAMPLE_METADATA_ALIASES.items()
+    }
+    result: dict[str, str | None] = {name: None for name in _SAMPLE_METADATA_ALIASES}
+    for key, value in characteristics.items():
+        normalized_key = _metadata_key(str(key))
+        raw_value = _metadata_value(value)
+        if normalized_key in {"disease state", "subject status", "health state", "inflammation status"} and raw_value:
+            state_match = re.search(
+                r"\b(uninflamed|inflamed|inactive|active|remission|quiescent)\b",
+                raw_value,
+                re.IGNORECASE,
+            )
+            if state_match and result["health_state"] is None:
+                result["health_state"] = state_match.group(1).casefold()
+        for target, target_aliases in aliases.items():
+            if normalized_key in target_aliases and result[target] is None:
+                result[target] = raw_value
+                break
+
+    # GEO source_name_ch1 is an explicit sample-origin field. Use it as tissue
+    # only when it clearly names an anatomical source, not a generic cell sort.
+    tissue_cues = re.compile(
+        r"\b(colon\w*|rect\w*|ileum\w*|ileal\w*|intestin\w*|gut|mucosa\w*|lamina propria|"
+        r"pouch|biopsy|tissue|blood|pbmc|ileocolon\w*|duoden\w*|stomach|gastric|liver|skin)\b",
+        re.IGNORECASE,
+    )
+    if result["tissue"] is None and source_name and tissue_cues.search(source_name):
+        result["tissue"] = source_name.strip()
+    return result
+
+
+def _refresh_sample_metadata(connection: duckdb.DuckDBPyConnection, gsm_id: str) -> None:
+    row = connection.execute(
+        "SELECT characteristics, source_name FROM geo_samples WHERE gsm_id=?", [gsm_id]
+    ).fetchone()
+    if row is None:
+        return
+    fields = extract_sample_metadata(row[0], row[1])
+    qualification = connection.execute(
+        "SELECT disease_status, tissue_source FROM geo_sample_qualification WHERE gsm_id=?",
+        [gsm_id],
+    ).fetchone()
+    if qualification:
+        fields["disease"] = fields["disease"] or _metadata_value(qualification[0])
+        fields["tissue"] = fields["tissue"] or _metadata_value(qualification[1])
+    save_metadata(
+        connection, gsm_id, fields["disease"], fields["health_state"], fields["tissue"],
+        fields["cell_type"], fields["age"], fields["sex"], fields["treatment"],
+        fields["treatment_response"],
+    )
+
+
+def backfill_sample_metadata(
+    connection: duckdb.DuckDBPyConnection,
+    gse_id: str | None = None,
+) -> int:
+    query = "SELECT gsm_id FROM geo_samples"
+    parameters: list[str] = []
+    if gse_id:
+        query += " WHERE gse_id=?"
+        parameters.append(gse_id)
+    rows = connection.execute(query + " ORDER BY gsm_id", parameters).fetchall()
+    for (gsm_id,) in rows:
+        _refresh_sample_metadata(connection, gsm_id)
+    return len(rows)
 
 
 def save_dataset(
@@ -277,6 +401,8 @@ def save_sample(
             is_longitudinal,
         ],
     )
+
+    _refresh_sample_metadata(connection, gsm_id)
 
 
 def save_characteristics(
@@ -601,6 +727,98 @@ def get_qualification(
     ).fetchone()
 
 
+def save_sample_qualification(
+    connection: duckdb.DuckDBPyConnection,
+    gsm_id: str,
+    qualification: str,
+    tissue_source: str | None = None,
+    disease_status: str | None = None,
+    modality_evidence: str | None = None,
+    evidence: str | list | dict | None = None,
+    uncertainties: str | list | dict | None = None,
+) -> None:
+    """Insert or update a qualification decision for a registered GSM."""
+    allowed = {"include", "exclude", "uncertain"}
+    qualification = qualification.lower()
+    if qualification not in allowed:
+        raise ValueError(f"Invalid sample qualification {qualification!r}; expected one of {sorted(allowed)}")
+    if not sample_exists(connection, gsm_id):
+        raise ValueError(f"Cannot qualify {gsm_id}: sample is not registered in geo_samples")
+    connection.execute(
+        """
+        INSERT INTO geo_sample_qualification (
+            gsm_id, qualification, tissue_source, disease_status,
+            modality_evidence, evidence, uncertainties, qualified_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, now())
+        ON CONFLICT (gsm_id) DO UPDATE SET
+            qualification = EXCLUDED.qualification,
+            tissue_source = EXCLUDED.tissue_source,
+            disease_status = EXCLUDED.disease_status,
+            modality_evidence = EXCLUDED.modality_evidence,
+            evidence = EXCLUDED.evidence,
+            uncertainties = EXCLUDED.uncertainties,
+            qualified_at = now()
+        """,
+        [gsm_id, qualification, tissue_source, disease_status, modality_evidence,
+         _serialize_text(evidence), _serialize_text(uncertainties)],
+    )
+    _refresh_sample_metadata(connection, gsm_id)
+
+
+def get_sample_qualifications(connection: duckdb.DuckDBPyConnection, gse_id: str) -> list[tuple]:
+    return connection.execute(
+        """
+        SELECT q.gsm_id, s.gse_id, q.qualification, q.tissue_source,
+               q.disease_status, q.modality_evidence, q.evidence,
+               q.uncertainties, q.qualified_at
+        FROM geo_sample_qualification q
+        JOIN geo_samples s USING (gsm_id)
+        WHERE s.gse_id = ?
+        ORDER BY q.gsm_id
+        """,
+        [gse_id],
+    ).fetchall()
+
+
+def save_qualification_batch(
+    connection: duckdb.DuckDBPyConnection,
+    gse_id: str,
+    dataset: dict,
+    samples: list[dict],
+) -> None:
+    """Save dataset and GSM decisions together, rolling back incomplete batches."""
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        save_qualification(
+            connection, gse_id, dataset["decision"], dataset.get("is_human"),
+            dataset.get("is_single_cell"), dataset.get("is_ibd_related"),
+            dataset.get("disease"), dataset.get("modality"), dataset.get("tissue"),
+            dataset.get("confidence"), dataset.get("evidence"), dataset.get("uncertainties"),
+        )
+        expected = {row[0] for row in connection.execute(
+            "SELECT gsm_id FROM geo_samples WHERE gse_id = ?", [gse_id]
+        ).fetchall()}
+        observed = [str(item.get("gsm_id", "")) for item in samples]
+        if len(observed) != len(set(observed)):
+            raise ValueError("Sample qualification payload contains duplicate gsm_id values")
+        unknown = set(observed) - expected
+        if unknown:
+            raise ValueError(f"Sample qualification includes GSMs not registered under {gse_id}: {sorted(unknown)}")
+        missing = expected - set(observed)
+        if missing:
+            raise ValueError(f"Sample qualification is incomplete for {gse_id}; missing GSMs: {sorted(missing)}")
+        for item in samples:
+            save_sample_qualification(
+                connection, item["gsm_id"], item["decision"], item.get("tissue_source"),
+                item.get("disease_status"), item.get("modality_evidence"),
+                item.get("evidence"), item.get("uncertainties"),
+            )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
 def catalog_report(
     connection: duckdb.DuckDBPyConnection,
 ) -> dict:
@@ -633,9 +851,25 @@ def catalog_report(
         qualification: count for qualification, count in qualification_rows
     }
 
+    sample_qualification_rows = connection.execute("""
+        SELECT qualification, COUNT(*)
+        FROM geo_sample_qualification
+        GROUP BY qualification
+        ORDER BY qualification
+    """).fetchall()
+    sample_qualifications = {qualification: count for qualification, count in sample_qualification_rows}
+    unqualified_samples = connection.execute("""
+        SELECT COUNT(*)
+        FROM geo_samples s
+        LEFT JOIN geo_sample_qualification q USING (gsm_id)
+        WHERE q.gsm_id IS NULL
+    """).fetchone()[0]
+
     return {
         "total_datasets": total,
         "qualifications": qualifications,
+        "sample_qualifications": sample_qualifications,
+        "unqualified_sample_count": unqualified_samples,
     }
 
 
@@ -977,6 +1211,8 @@ def _parse_optional_bool(value: str) -> bool | None:
 @click.option("--confidence")
 @click.option("--evidence")
 @click.option("--uncertainties")
+@click.option("--sample-results-file", type=click.Path(exists=True, path_type=Path),
+              help="JSON array with one decision per registered GSM; saves dataset and samples atomically")
 @click.pass_context
 def save_qualification_command(
     ctx: click.Context,
@@ -991,29 +1227,41 @@ def save_qualification_command(
     confidence: str | None,
     evidence: str | None,
     uncertainties: str | None,
+    sample_results_file: Path | None,
 ) -> None:
     """Save or update a qualification decision for a registered GSE."""
     connection = get_connection(ctx.obj["db"])
     try:
-        save_qualification(
-            connection,
-            gse_id,
-            qualification.lower(),
-            _parse_optional_bool(is_human.lower()),
-            _parse_optional_bool(is_single_cell.lower()),
-            _parse_optional_bool(is_ibd_related.lower()),
-            disease,
-            modality,
-            tissue,
-            confidence,
-            evidence,
-            uncertainties,
-        )
+        if sample_results_file:
+            try:
+                sample_results = json.loads(sample_results_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Cannot read sample results JSON: {exc}") from exc
+            if not isinstance(sample_results, list):
+                raise ValueError("Sample results JSON must be an array")
+            save_qualification_batch(
+                connection, gse_id,
+                {"decision": qualification.lower(), "is_human": _parse_optional_bool(is_human.lower()),
+                 "is_single_cell": _parse_optional_bool(is_single_cell.lower()),
+                 "is_ibd_related": _parse_optional_bool(is_ibd_related.lower()),
+                 "disease": disease, "modality": modality, "tissue": tissue,
+                 "confidence": confidence, "evidence": evidence, "uncertainties": uncertainties},
+                sample_results,
+            )
+        else:
+            save_qualification(
+                connection, gse_id, qualification.lower(),
+                _parse_optional_bool(is_human.lower()),
+                _parse_optional_bool(is_single_cell.lower()),
+                _parse_optional_bool(is_ibd_related.lower()), disease, modality, tissue,
+                confidence, evidence, uncertainties,
+            )
         saved = get_qualification(connection, gse_id)
         if saved is None:
             raise click.ClickException(
                 f"Qualification write could not be verified for {gse_id}"
             )
+        sample_qualification_count = len(get_sample_qualifications(connection, gse_id))
     except (ValueError, duckdb.Error) as exc:
         raise click.ClickException(str(exc)) from exc
     finally:
@@ -1025,12 +1273,28 @@ def save_qualification_command(
                 "gse_id": saved[0],
                 "qualification": saved[1],
                 "verified": True,
+                "sample_qualification_count": sample_qualification_count,
                 "qualified_at": str(saved[11]),
             },
             indent=2,
             ensure_ascii=False,
         )
     )
+
+
+@cli.command("get-sample-qualifications")
+@click.argument("gse_id")
+@click.pass_context
+def get_sample_qualifications_command(ctx: click.Context, gse_id: str) -> None:
+    """List stored sample-level decisions for a GSE."""
+    connection = get_connection(ctx.obj["db"])
+    try:
+        rows = get_sample_qualifications(connection, gse_id)
+    finally:
+        connection.close()
+    keys = ("gsm_id", "gse_id", "decision", "tissue_source", "disease_status",
+            "modality_evidence", "evidence", "uncertainties", "qualified_at")
+    click.echo(json.dumps([dict(zip(keys, row)) for row in rows], indent=2, ensure_ascii=False, default=str))
 
 
 @cli.command("get-qualification")
@@ -1093,6 +1357,42 @@ def report_command(
             ensure_ascii=False,
         )
     )
+
+
+@cli.command("backfill-sample-metadata")
+@click.option("--gse", "gse_id", help="Limit the backfill to one GEO Series accession")
+@click.pass_context
+def backfill_sample_metadata_command(ctx: click.Context, gse_id: str | None) -> None:
+    """Populate normalized sample metadata from stored GEO fields and GSM decisions."""
+    connection = get_connection(ctx.obj["db"])
+    try:
+        processed = backfill_sample_metadata(connection, gse_id.upper() if gse_id else None)
+        where_sql = " WHERE s.gse_id=?" if gse_id else ""
+        params = [gse_id.upper()] if gse_id else []
+        populated = connection.execute(
+            f"""SELECT COUNT(*) FROM geo_sample_metadata m
+                JOIN geo_samples s USING (gsm_id){where_sql}
+                AND ({' OR '.join(f'm.{column} IS NOT NULL' for column in (
+                    'disease', 'health_state', 'tissue', 'cell_type', 'age', 'sex',
+                    'treatment', 'treatment_response'))})""" if where_sql else
+            """SELECT COUNT(*) FROM geo_sample_metadata m
+                WHERE disease IS NOT NULL OR health_state IS NOT NULL OR tissue IS NOT NULL
+                   OR cell_type IS NOT NULL OR age IS NOT NULL OR sex IS NOT NULL
+                   OR treatment IS NOT NULL OR treatment_response IS NOT NULL""",
+            params,
+        ).fetchone()[0]
+        table_rows = connection.execute(
+            "SELECT COUNT(*) FROM geo_sample_metadata m JOIN geo_samples s USING (gsm_id)" + where_sql,
+            params,
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    click.echo(json.dumps({
+        "processed_samples": processed,
+        "metadata_rows": table_rows,
+        "samples_with_at_least_one_normalized_field": populated,
+        "gse_id": gse_id.upper() if gse_id else None,
+    }, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
