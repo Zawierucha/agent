@@ -1,7 +1,7 @@
 ---
 name: sc-dataset-search
 description: Search NCBI GEO for candidate human single-cell RNA-seq datasets.
-version: 0.3.0
+version: 0.4.1
 author: Piotr Zawierucha
 license: MIT
 platforms: [linux]
@@ -104,11 +104,13 @@ Before calling the tool:
 
 ## Tool
 
-Use:
+Run through the `terminal` tool from the repository root:
 
-/workspace/.agents/tools/sc_dataset/geo_search.py
+`uv run python .agents/tools/sc_dataset/geo_search.py --query <Q1> --query <Q2> ... --pretty`
 
-Pass the generated search queries to the tool.
+Pass the generated search queries to the tool. `--max-results` bounds one
+page per query (1..10000, default 100); the tool has no `retstart`
+pagination.
 
 The tool is generic and does not contain IBD-specific search terms.
 
@@ -119,6 +121,8 @@ The tool is responsible for:
 - extracting GSE accessions
 - normalizing results
 - deduplicating GSE accessions
+- bounded transient-failure handling (see Completeness safeguards)
+- reporting per-query completeness in its output envelope
 
 The tool must not contain hardcoded IBD terminology.
 
@@ -133,17 +137,74 @@ After receiving the results:
 
 ## Output
 
-Return candidate GSE datasets with their available GEO metadata.
+The tool prints one JSON envelope:
 
-For every candidate include, when available:
+```
+{
+  "queries": [
+    {"query": "...", "status": "success|partial|failed",
+     "count": <int|null>, "retrieved": <int>, "error": <str|null>}
+  ],
+  "records": [ ...normalized candidate records... ],
+  "dropped_no_gse": <int>
+}
+```
 
-- GSE accession
-- title
-- organism
-- summary
-- platform
-- number of samples
-- search query that discovered the dataset
+Field semantics:
+
+- `count` — total results NCBI reported for the query; `null` when absent
+  or unparsable. Never estimated.
+- `retrieved` — IDs actually fetched from NCBI for that query, before
+  deduplication and before dropping records without a GSE accession.
+- `status` — `success` (query completed; zero results is a success with
+  `count=0`, `retrieved=0`), `partial` (completed but `count` exceeds
+  `retrieved`, i.e. the single page did not cover all matches), `failed`
+  (query errored after bounded retries or on a permanent HTTP error;
+  `error` names the exception and reason; other queries' results are kept).
+- `dropped_no_gse` — normalized records removed because no GSE accession
+  could be located in them.
+
+Example envelope (constructed illustration, not actual NCBI output; run
+with `--max-results 2` explains the third query's cap):
+
+```
+{
+  "queries": [
+    {"query": "Crohn disease single cell", "status": "success",
+     "count": 4, "retrieved": 4, "error": null},
+    {"query": "ulcerative colitis scRNA-seq", "status": "success",
+     "count": 0, "retrieved": 0, "error": null},
+    {"query": "IBD 10x Genomics", "status": "partial",
+     "count": 5, "retrieved": 2, "error": null}
+  ],
+  "records": [
+    {"gse_id": "GSE111", "title": "...", "summary": "...", "taxon": "Homo sapiens",
+     "gds_type": "Expression profiling by high throughput sequencing",
+     "organism": "Homo sapiens", "platform": "GPL24676", "n_samples": 18,
+     "query": "Crohn disease single cell"},
+    {"gse_id": "GSE222", "title": "...", "summary": "...", "taxon": "Homo sapiens",
+     "gds_type": "Expression profiling by high throughput sequencing",
+     "organism": "Homo sapiens", "platform": "GPL14951", "n_samples": 6,
+     "query": "Crohn disease single cell"},
+    {"gse_id": "GSE333", "title": "...", "summary": "...", "taxon": "Homo sapiens",
+     "gds_type": "Expression profiling by high throughput sequencing",
+     "organism": "Homo sapiens", "platform": "GPL20781", "n_samples": 24,
+     "query": "Crohn disease single cell"},
+    {"gse_id": "GSE444", "title": "...", "summary": "...", "taxon": "Homo sapiens",
+     "gds_type": "Expression profiling by high throughput sequencing",
+     "organism": "Homo sapiens", "platform": "GPL24676", "n_samples": 11,
+     "query": "Crohn disease single cell; IBD 10x Genomics"}
+  ],
+  "dropped_no_gse": 1
+}
+```
+
+Consistency of the example: 6 IDs retrieved before deduplication (4 + 0 + 2);
+1 retrieved record dropped for a missing GSE (`dropped_no_gse`); 5 locatable
+records with GSE444 found by two queries deduplicate into 4 candidates.
+
+For every candidate record include, when available: GSE accession, title,
+organism, summary, platform, number of samples, discovery query.
 
 Do not perform biological qualification.
 
@@ -152,4 +213,59 @@ single-cell dataset.
 
 ## Completeness safeguards
 
-For a production-complete search, compare each NCBI ESearch `count` with the number retrieved. The current tool has no `retstart` pagination; use a `--max-results` value above the verified count (up to the NCBI limit), record one retrieved page for that query, and do not call the query complete when the count is missing or exceeds the cap. Retry transient 403/429/5xx responses with bounded backoff. If a particular unquoted expression consistently returns HTTP 500, retry a logically equivalent exact-phrase expression and record both the original query and the substitution.
+Act on the envelope; do not treat the search as complete unless every
+query report justifies it:
+
+1. Any `status: "failed"` — copy the query and its `error` string verbatim
+   into the results summary handed to later stages; the missing coverage
+   must be visible there, not only in logs.
+2. `status: "partial"` — the page was capped: rerun that query with a
+   higher `--max-results` (up to 10000); if `count` exceeds 10000, the
+   query is incomplete by design until `retstart` pagination exists —
+   state this explicitly and do not call the candidate set complete.
+3. `count: null` — completeness is unverifiable for that query; say so
+   instead of estimating.
+4. `dropped_no_gse` greater than zero — report how many GEO records could
+   not be located to a GSE series.
+5. `retrieved` counts IDs fetched before deduplication and before dropping
+   records without a GSE; never present it as the number of final candidate
+   records.
+
+HTTP transport handling belongs to the tool: retryable statuses (403, 429,
+500, 502, 503, 504) and transient connection/timeout failures are retried
+at most 4 attempts total with `Retry-After` or exponential backoff;
+permanent errors such as HTTP 400 fail the query immediately and are
+reported, not hidden. Only after the tool reports a query as failed may
+the agent substitute a logically equivalent exact-phrase query for a
+persistently failing unquoted expression; record both the original query
+and the substitution in the results summary.
+
+## Stage gate
+
+Two dimensions are separate and must not be conflated:
+
+- **Execution completeness** — did every *planned* query in the run finish
+  as reported in the envelope?
+- **Strategy coverage** — did the planned query set span the required IBD
+  and single-cell vocabulary?
+
+The gate for starting qualification:
+
+1. Proceed when every planned query has `status: "success"` — including
+   `success` with `count=0`, which is a valid finished search, not a
+   reason to retry.
+2. `partial` means incomplete: first try to complete the query (higher
+   `--max-results` up to 10000, or a justified supplementary query;
+   `retstart` pagination is not available in this tool).
+3. `failed` requires error handling: re-run, or substitute per the
+   safeguard above; the error stays visible in the report.
+4. `count=null` makes that query's completeness unverifiable: state it,
+   never present the run as verified-complete.
+5. If `partial`, `failed`, or `count=null` reports remain after justified
+   remediation attempts, qualification may start only with the limitations
+   explicitly presented and the user's acceptance of continuing.
+6. When all planned queries succeeded, do NOT block qualification merely
+   because the vocabulary could still be broadened. Strategy gaps are
+   reported — list which required vocabulary combinations were not run —
+   as an optional extension decision for the user, not as an execution
+   failure.

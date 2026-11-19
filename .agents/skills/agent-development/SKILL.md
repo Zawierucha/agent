@@ -89,6 +89,17 @@ Route work per `references/delegation.md`. Summary:
 - Every delegated brief must demand a report of the model actually used and
   of real command outputs; the parent re-verifies diff and tests before
   relaying the child's claims.
+- Delegation contract (structural, not prompt-only): before EVERY
+  `delegate_task` call (any action), `scripts/delegation_check.py preflight`
+  must exit 0 — no top-level `option`/shorthand, `option` inside every
+  `tasks[]` entry, one route per call; after completion,
+  `delegation_check.py postcheck --route <name>` must confirm the runtime
+  `Model:` metadata against `templates/delegation_manifest.json`. An
+  unconfirmed route means the phase was NOT delegated: stop the child and
+  re-dispatch a fresh spawn. Never `continue` a wrong-route child. Manifest
+  entries are recorded only from runtime `Model:` evidence and only after the
+  user confirms any `model_map` change. Full procedure:
+  `references/delegation.md`.
 
 ## Files
 
@@ -103,6 +114,8 @@ Route work per `references/delegation.md`. Summary:
 | `templates/tool_template.py` | Starter for a new CLI tool |
 | `templates/test_template.py` | Starter for a new pytest file |
 | `scripts/validate_skill.py` | Structural validation of skill directories |
+| `scripts/delegation_check.py` | Preflight/postcheck of delegation calls |
+| `templates/delegation_manifest.json` | Route -> runtime-verified model record |
 
 ## Pitfalls
 
