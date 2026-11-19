@@ -1,0 +1,10 @@
+{
+  "_comment": "Route -> last runtime-verified model mapping for delegate_task. Updated by scripts/delegation_check.py manifest record. Not Hermes config: an expectation record for contract postchecks only.",
+  "routes": {
+    "developer": {
+      "model": "openai/gpt-6-luna",
+      "verified_at": "2026-11-19",
+      "evidence": "deleg_bd525801 batch notification metadata: 'Role: leaf Model: openai/gpt-6-luna'"
+    }
+  }
+}
