@@ -10,7 +10,7 @@ description: Profile inspected GEO source formats and map every dataset to the p
 
 Apply the project's fixed AnnData contract to every dataset that will later enter shared analysis. The sole schema source of truth is `data/anndata_schema.json`; do not propose, infer, or create a dataset-specific schema. This stage starts after GEO files have been downloaded and the format inspector has inventoried them. It reports whether 10x Matrix Market bundles are present, how those bundles map to catalogued GSM samples, which non-10x formats are also present, and what format-specific reader or conversion step is needed for each before mapping into the same contract.
 
-This stage reports the canonical schema and the source-to-schema requirements. It does not construct, merge, normalize, or filter an AnnData object and does not modify the catalog or source files. A future AnnData builder must validate its output against `data/anndata_schema.json` before saving it.
+This stage reports the canonical schema and the source-to-schema requirements. It does not construct, merge, normalize, or filter an AnnData object and does not modify the catalog or source files. After reviewing format-specific mapping requirements, use `sc-dataset-anndata-ingestion` to try adapters, build per-GSM AnnData objects, and validate saved outputs against `data/anndata_schema.json`.
 
 Use only `.agents/tools/sc_dataset/geo_anndata_prepare.py` for the deterministic report.
 
@@ -67,4 +67,4 @@ The canonical contract is versioned and mandatory. Change it only through an exp
 
 ## Limits
 
-The inspector report contains clues and candidate groups, not proof of matrix contents or sample identity. This tool reads those reports and the GSM catalog and embeds the canonical contract and its hash; it does not inspect matrix values, load H5AD/HDF5 internals, perform conversions, or write AnnData. Physical schema enforcement on `.h5ad` outputs belongs in the future builder/validator stage. Non-10x files need format-specific inspection before they can be mapped to the same contract.
+The inspector report contains clues and candidate groups, not proof of matrix contents or sample identity. This tool reads those reports and the GSM catalog and embeds the canonical contract and its hash; it does not inspect matrix values, load H5AD/HDF5 internals, perform conversions, or write AnnData. Physical schema enforcement on `.h5ad` outputs is performed by `sc-dataset-anndata-ingestion`. Non-10x files need format-specific inspection before they can be mapped to the same contract.

@@ -1,0 +1,63 @@
+{
+  "schema_id": "hermes.geo.anndata",
+  "schema_version": "1.1",
+  "status": "canonical",
+  "description": "Fixed AnnData contract for all GEO datasets processed by this project. Missing source values remain null; datasets do not define new columns.",
+  "anndata_contract": {
+    "X": {
+      "dtype": "float32",
+      "storage": "CSR sparse matrix preferred",
+      "meaning": "expression values as supplied; record whether raw counts, normalized values, or unknown in uns.matrix_semantics"
+    },
+    "layers": {
+      "counts": {
+        "optional": true,
+        "storage": "CSR or CSC sparse matrix",
+        "meaning": "populate only when raw counts are confirmed and dimensions and order match X"
+      }
+    },
+    "obs": {
+      "index": {
+        "name": "cell_id",
+        "dtype": "string",
+        "rule": "unique; construct as <sample_id>:<source_barcode> when source barcodes are only sample-unique"
+      },
+      "sample_id": {"dtype": "string", "nullable": true, "meaning": "GEO GSM accession when explicitly mapped"},
+      "source_barcode": {"dtype": "string", "nullable": true},
+      "donor_id": {"dtype": "string", "nullable": true},
+      "organism": {"dtype": "string", "nullable": true},
+      "tissue": {"dtype": "string", "nullable": true},
+      "cell_type": {"dtype": "string", "nullable": true, "meaning": "per-cell annotation; leave null until cell annotation is performed"},
+      "disease": {"dtype": "string", "nullable": true},
+      "condition": {"dtype": "string", "nullable": true},
+      "assay": {"dtype": "string", "nullable": true},
+      "modality": {"dtype": "string", "nullable": true},
+      "timepoint": {"dtype": "string", "nullable": true},
+      "source_accession": {"dtype": "string", "nullable": true},
+      "n_counts": {"dtype": "Int64", "nullable": true, "meaning": "derived QC field; do not invent before matrix semantics are established"},
+      "n_features": {"dtype": "Int32", "nullable": true, "meaning": "derived QC field"},
+      "percent_mito": {"dtype": "Float32", "nullable": true, "meaning": "derived QC field; requires a declared mitochondrial feature annotation"}
+    },
+    "var": {
+      "index": {"name": "feature_id", "dtype": "string", "rule": "unique within the object; preserve source identifiers"},
+      "feature_name": {"dtype": "string", "nullable": true},
+      "feature_type": {"dtype": "string", "nullable": true, "meaning": "for example Gene Expression or Antibody Capture when supplied"},
+      "genome_build": {"dtype": "string", "nullable": true}
+    },
+    "uns": {
+      "schema_version": "schema version used for harmonization",
+      "source_gse": "GEO Series accession",
+      "source_format": "format and source file inventory",
+      "matrix_semantics": "raw counts, normalized values, or unknown; never infer silently",
+      "feature_id_namespace": "source feature identifier namespace when known",
+      "harmonization_notes": "explicit mapping, conversions, and unresolved differences"
+    }
+  },
+  "enforcement_rules": [
+    "Use this exact column set and declared dtypes for every dataset; do not add dataset-specific obs or var columns.",
+    "Keep unavailable metadata fields present with null values; do not omit contract columns or guess values.",
+    "Keep obs rows aligned to X rows and var rows aligned to X columns.",
+    "Keep cell_type null until per-cell annotation is performed; do not copy sample-level cell labels into it.",
+    "Record raw counts, normalized values, or unknown for matrix_semantics; never normalize data of unknown semantics automatically."
+  ]
+}

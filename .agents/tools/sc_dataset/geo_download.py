@@ -117,11 +117,18 @@ def supplementary_url(gse_id: str) -> str:
     return f"https://ftp.ncbi.nlm.nih.gov/geo/series/{bucket}/{gse_id.upper()}/suppl/"
 
 
-def list_files(gse_id: str, timeout: float) -> tuple[str, list[dict[str, Any]]]:
+def list_files(gse_id: str, timeout: float, retries: int = 3) -> tuple[str, list[dict[str, Any]]]:
     listing_url = supplementary_url(gse_id)
-    response = requests.get(listing_url, timeout=timeout, headers={"User-Agent": USER_AGENT})
-    if response.status_code == 404:
-        return listing_url, []
+    response = None
+    for attempt in range(1, retries + 2):
+        response = requests.get(listing_url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+        if response.status_code == 404:
+            return listing_url, []
+        if response.status_code not in {403, 429} and response.status_code < 500:
+            break
+        if attempt <= retries:
+            time.sleep(min(2 ** (attempt - 1), 30))
+    assert response is not None
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     files = []
@@ -198,7 +205,7 @@ def download_one(item: dict[str, Any], target_dir: Path, timeout: float, retries
                     response.raise_for_status()
                 response.raise_for_status()
                 expected = response.headers.get("Content-Length")
-                expected_size = int(expected) if expected and expected.isdigit() else item.get("listed_size_bytes")
+                expected_size = (int(expected) if expected and expected.isdigit() else item.get("listed_size_bytes")) if not response.headers.get("Content-Encoding") else None
                 written = 0
                 with part.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=1024 * 1024):
@@ -211,6 +218,7 @@ def download_one(item: dict[str, Any], target_dir: Path, timeout: float, retries
                 result["size_bytes"] = written
                 result["sha256"] = sha256_file(target)
                 result["download_status"] = "downloaded"
+                result["error"] = None
                 return result
         except (requests.RequestException, OSError, ValueError) as exc:
             result["error"] = str(exc)
@@ -228,7 +236,7 @@ def run_gse(db_path: Path, root: Path, gse_id: str, timeout: float,
             retries: int, download: bool) -> dict[str, Any]:
     gse_id = gse_id.upper()
     snapshot = catalog_snapshot(db_path, gse_id)
-    listing_url, source_files = list_files(gse_id, timeout)
+    listing_url, source_files = list_files(gse_id, timeout, retries)
     dataset_dir = root / gse_id
     supplementary_dir = dataset_dir / "supplementary"
     manifest_path = dataset_dir / "manifest.json"

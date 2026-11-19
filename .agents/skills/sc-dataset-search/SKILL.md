@@ -149,3 +149,7 @@ Do not perform biological qualification.
 
 Do not claim that a candidate dataset is confirmed to be an IBD
 single-cell dataset.
+
+## Completeness safeguards
+
+For a production-complete search, compare each NCBI ESearch `count` with the number retrieved. The current tool has no `retstart` pagination; use a `--max-results` value above the verified count (up to the NCBI limit), record one retrieved page for that query, and do not call the query complete when the count is missing or exceeds the cap. Retry transient 403/429/5xx responses with bounded backoff. If a particular unquoted expression consistently returns HTTP 500, retry a logically equivalent exact-phrase expression and record both the original query and the substitution.
