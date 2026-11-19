@@ -35,11 +35,11 @@ def _get_soft_url(accession: str) -> str:
         raise ValueError(f"Invalid GEO Series accession: {accession}")
 
     digits = match.group(1)
-    if len(digits) < 3:
-        raise ValueError(f"Invalid GEO Series accession: {accession}")
-
     series_accession = f"GSE{digits}"
-    series_bucket = f"GSE{digits[:3]}nnn"
+    # GEO buckets group accessions by thousands: GSE9686 -> GSE9nnn, GSE10191 -> GSE10nnn.
+    # Accessions below 1000 use the GSEnnn bucket.
+    bucket_prefix = digits[:-3]
+    series_bucket = f"GSE{bucket_prefix}nnn"
 
     return (
         f"{GEO_FTP_URL}/{series_bucket}/{series_accession}"

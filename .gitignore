@@ -27,6 +27,8 @@ Thumbs.db
 *.temp
 
 # Local DuckDB data
-/data/*.duckdb
-/data/*.duckdb.wal
-/data/schema.sql
+/data/
+!/data/
+/data/*
+!/data/schema.sql
+!/data/anndata_schema.json
