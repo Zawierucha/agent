@@ -1,551 +1,330 @@
-from __future__ import annotations
-
+import gzip
+import json
 from unittest.mock import Mock
 
 import pytest
 import requests
+from click.testing import CliRunner
 
 from tools.sc_dataset.geo_metadata import (
-    _extract_gsm_ids,
-    _fetch_sample_summaries,
-    _fetch_summary,
-    _find_geo_id,
+    GEO_FTP_URL,
+    _get_soft_url,
     _normalize_sample,
-    _normalize_series,
+    _parse_characteristics,
+    _parse_soft,
+    _parse_soft_value,
     get_geo_metadata,
+    main,
 )
 
 
-def test_find_geo_id() -> None:
-    session = Mock()
-
-    response = Mock()
-    response.json.return_value = {
-        "esearchresult": {
-            "idlist": ["123456"],
-        }
-    }
-
-    session.get.return_value = response
-
-    result = _find_geo_id(
-        "GSE123456",
-        timeout=10.0,
-        session=session,
+def test_get_soft_url_builds_expected_url():
+    assert _get_soft_url("GSE346721") == (
+        f"{GEO_FTP_URL}/GSE346nnn/GSE346721/soft/" "GSE346721_family.soft.gz"
     )
 
-    assert result == "123456"
 
-    session.get.assert_called_once()
-
-    kwargs = session.get.call_args.kwargs
-
-    assert kwargs["params"] == {
-        "db": "gds",
-        "term": "GSE123456[Accession]",
-        "retmax": 1,
-        "retmode": "json",
-    }
-
-    assert kwargs["timeout"] == 10.0
+@pytest.mark.parametrize(
+    "accession",
+    ["GSE12", "GSE", "GSM123", "abc", "GSE12x"],
+)
+def test_get_soft_url_rejects_invalid_accession(accession):
+    with pytest.raises(ValueError, match="Invalid GEO Series accession"):
+        _get_soft_url(accession)
 
 
-def test_find_geo_id_raises_when_accession_not_found() -> None:
-    session = Mock()
-
-    response = Mock()
-    response.json.return_value = {
-        "esearchresult": {
-            "idlist": [],
-        }
-    }
-
-    session.get.return_value = response
-
-    with pytest.raises(
-        ValueError,
-        match="GEO accession not found",
-    ):
-        _find_geo_id(
-            "GSE999999",
-            timeout=10.0,
-            session=session,
-        )
+def test_parse_soft_value_strips_whitespace_and_quotes():
+    assert _parse_soft_value('  "Colon tissue"  ') == "Colon tissue"
 
 
-def test_find_geo_id_propagates_http_error() -> None:
-    session = Mock()
-
-    response = Mock()
-    response.raise_for_status.side_effect = requests.HTTPError()
-
-    session.get.return_value = response
-
-    with pytest.raises(requests.HTTPError):
-        _find_geo_id(
-            "GSE123456",
-            timeout=10.0,
-            session=session,
-        )
-
-
-def test_fetch_summary() -> None:
-    session = Mock()
-
-    response = Mock()
-    response.json.return_value = {
-        "result": {
-            "123456": {
-                "uid": "123456",
-                "accession": "GSE123456",
-                "title": "Example dataset",
-            }
-        }
-    }
-
-    session.get.return_value = response
-
-    result = _fetch_summary(
-        "123456",
-        timeout=10.0,
-        session=session,
+def test_parse_characteristics_handles_repeated_keys_and_unparsed_values():
+    result = _parse_characteristics(
+        [
+            "disease: Crohn disease",
+            "tissue: colon",
+            "disease: ulcerative colitis",
+            "sample note without colon",
+            "",
+        ]
     )
 
     assert result == {
-        "uid": "123456",
-        "accession": "GSE123456",
-        "title": "Example dataset",
+        "disease": ["Crohn disease", "ulcerative colitis"],
+        "tissue": "colon",
+        "unparsed": ["sample note without colon"],
     }
 
-    session.get.assert_called_once()
 
-    kwargs = session.get.call_args.kwargs
-
-    assert kwargs["params"] == {
-        "db": "gds",
-        "id": "123456",
-        "retmode": "json",
-    }
-
-    assert kwargs["timeout"] == 10.0
+def test_parse_characteristics_handles_empty_values():
+    assert _parse_characteristics([]) == {}
+    assert _parse_characteristics(["", "  "]) == {}
 
 
-def test_fetch_summary_raises_when_record_missing() -> None:
-    session = Mock()
-
-    response = Mock()
-    response.json.return_value = {
-        "result": {
-            "uids": [],
+def test_normalize_sample_parses_fields_and_characteristics():
+    result = _normalize_sample(
+        {
+            "gsm_id": "GSM123456",
+            "title": "Sample 1",
+            "summary": ["First line", "Second line"],
+            "source_name": ["Colon tissue"],
+            "organism": ["Homo sapiens"],
+            "characteristics": [
+                "disease: Crohn disease",
+                "tissue: colon",
+            ],
+            "platform": "GPL24676",
         }
+    )
+
+    assert result == {
+        "gsm_id": "GSM123456",
+        "title": "Sample 1",
+        "summary": "First line Second line",
+        "source_name": "Colon tissue",
+        "organism": "Homo sapiens",
+        "characteristics": {
+            "disease": "Crohn disease",
+            "tissue": "colon",
+        },
+        "platform": "GPL24676",
     }
 
-    session.get.return_value = response
 
-    with pytest.raises(
-        ValueError,
-        match="No GEO summary returned",
-    ):
-        _fetch_summary(
-            "123456",
-            timeout=10.0,
-            session=session,
-        )
-
-
-def test_extract_gsm_ids() -> None:
-    record = {
-        "samples": [
-            "GSM100",
-            "GSM200",
-            "GPL300",
-            "GSE400",
-        ]
+def test_normalize_sample_handles_missing_fields():
+    assert _normalize_sample({}) == {
+        "gsm_id": None,
+        "title": None,
+        "summary": None,
+        "source_name": None,
+        "organism": None,
+        "characteristics": {},
+        "platform": None,
     }
 
-    assert _extract_gsm_ids(record) == [
+
+def test_parse_soft_normalizes_series_and_samples():
+    soft = """^SERIES = GSE123456
+!Series_title = Human single-cell dataset
+!Series_summary = First summary line
+!Series_summary = Second summary line
+!Series_overall_design = Single-cell RNA sequencing
+!Series_organism = Homo sapiens
+!Series_platform_id = GPL24676
+!Series_sample_id = GSM100
+!Series_sample_id = GSM200
+^SAMPLE = GSM200
+!Sample_title = Sample 200
+!Sample_summary = Sample summary
+!Sample_source_name_ch1 = Colon tissue
+!Sample_organism_ch1 = Homo sapiens
+!Sample_characteristics_ch1 = disease: Crohn disease
+!Sample_characteristics_ch1 = tissue: colon
+!Sample_platform_id = GPL24676
+^SAMPLE = GSM100
+!Sample_title = Sample 100
+!Sample_characteristics_ch1 = tissue: rectum
+"""
+
+    result = _parse_soft(soft, "GSE123456")
+
+    assert result["gse"] == {
+        "gse_id": "GSE123456",
+        "title": "Human single-cell dataset",
+        "summary": "First summary line Second summary line",
+        "overall_design": "Single-cell RNA sequencing",
+        "organism": "Homo sapiens",
+        "taxon": "Homo sapiens",
+        "platform": "GPL24676",
+        "n_samples": 2,
+    }
+
+    assert [sample["gsm_id"] for sample in result["samples"]] == [
+        "GSM100",
+        "GSM200",
+    ]
+
+    assert result["samples"][0]["characteristics"] == {
+        "tissue": "rectum",
+    }
+
+    assert result["samples"][1]["characteristics"] == {
+        "disease": "Crohn disease",
+        "tissue": "colon",
+    }
+
+
+def test_parse_soft_raises_when_no_samples_found():
+    soft = "^SERIES = GSE123456\n!Series_title = No samples\n"
+
+    with pytest.raises(ValueError, match="No GSM sample records"):
+        _parse_soft(soft, "GSE123456")
+
+
+def test_parse_soft_keeps_samples_not_listed_in_series_sample_ids():
+    soft = """^SERIES = GSE123456
+!Series_sample_id = GSM100
+^SAMPLE = GSM100
+!Sample_title = Listed sample
+^SAMPLE = GSM200
+!Sample_title = Unlisted sample
+"""
+
+    result = _parse_soft(soft, "GSE123456")
+
+    assert [sample["gsm_id"] for sample in result["samples"]] == [
         "GSM100",
         "GSM200",
     ]
 
 
-def test_extract_gsm_ids_returns_empty_for_missing_samples() -> None:
-    assert _extract_gsm_ids({}) == []
+def test_parse_soft_handles_repeated_sample_characteristics():
+    soft = """^SERIES = GSE123456
+^SAMPLE = GSM100
+!Sample_characteristics_ch1 = disease: Crohn disease
+!Sample_characteristics_ch1 = disease: ulcerative colitis
+"""
 
+    result = _parse_soft(soft, "GSE123456")
 
-def test_extract_gsm_ids_returns_empty_for_invalid_samples() -> None:
-    assert _extract_gsm_ids(
-        {
-            "samples": "GSM100",
-        }
-    ) == []
-
-
-def test_normalize_series() -> None:
-    record = {
-        "title": "Human single-cell dataset",
-        "summary": "Example summary",
-        "overall_design": "Single-cell RNA sequencing",
-        "organism": "Homo sapiens",
-        "taxon": "9606",
-        "gpl": "GPL24676",
-        "n_samples": 5,
-        "samples": [
-            "GSM100",
-            "GSM200",
-        ],
-    }
-
-    result = _normalize_series(
-        record,
-        "GSE123456",
-    )
-
-    assert result == {
-        "gse_id": "GSE123456",
-        "title": "Human single-cell dataset",
-        "summary": "Example summary",
-        "overall_design": "Single-cell RNA sequencing",
-        "organism": "Homo sapiens",
-        "taxon": "9606",
-        "platform": "GPL24676",
-        "n_samples": 5,
-        "samples": [
-            "GSM100",
-            "GSM200",
-        ],
+    assert result["samples"][0]["characteristics"] == {
+        "disease": ["Crohn disease", "ulcerative colitis"],
     }
 
 
-def test_normalize_series_handles_missing_fields() -> None:
-    result = _normalize_series(
-        {
-            "title": "Example",
-        },
-        "GSE123456",
-    )
-
-    assert result["gse_id"] == "GSE123456"
-    assert result["title"] == "Example"
-    assert result["summary"] is None
-    assert result["overall_design"] is None
-    assert result["organism"] is None
-    assert result["platform"] is None
-    assert result["n_samples"] is None
-    assert result["samples"] == []
-
-
-def test_normalize_sample() -> None:
-    record = {
-        "title": "Sample 1",
-        "summary": "Sample summary",
-        "source_name": "Colon tissue",
-        "organism": "Homo sapiens",
-        "characteristics": [
-            "disease: Crohn disease",
-            "tissue: colon",
-        ],
-        "gpl": "GPL24676",
-    }
-
-    result = _normalize_sample(
-        record,
-        "GSM123456",
-    )
-
-    assert result == {
-        "gsm_id": "GSM123456",
-        "title": "Sample 1",
-        "summary": "Sample summary",
-        "source_name": "Colon tissue",
-        "organism": "Homo sapiens",
-        "characteristics": [
-            "disease: Crohn disease",
-            "tissue: colon",
-        ],
-        "platform": "GPL24676",
-    }
-
-
-def test_normalize_sample_handles_missing_fields() -> None:
-    result = _normalize_sample(
-        {},
-        "GSM123456",
-    )
-
-    assert result == {
-        "gsm_id": "GSM123456",
-        "title": None,
-        "summary": None,
-        "source_name": None,
-        "organism": None,
-        "characteristics": None,
-        "platform": None,
-    }
-
-
-def test_fetch_sample_summaries_empty_ids() -> None:
-    session = Mock()
-
-    result = _fetch_sample_summaries(
-        [],
-        timeout=10.0,
-        session=session,
-    )
-
-    assert result == []
-    session.get.assert_not_called()
-
-
-def test_fetch_sample_summaries() -> None:
-    session = Mock()
+def test_get_geo_metadata_fetches_and_parses_gzipped_soft(monkeypatch):
+    soft = b"""^SERIES = GSE123456
+!Series_title = Example
+^SAMPLE = GSM123456
+!Sample_title = Sample 1
+"""
 
     response = Mock()
-    response.json.return_value = {
-        "result": {
-            "uids": [
-                "100",
-                "200",
-            ],
-            "100": {
-                "title": "Sample 1",
-                "source_name": "Colon",
-                "organism": "Homo sapiens",
-                "characteristics": [
-                    "disease: Crohn disease",
-                ],
-                "gpl": "GPL24676",
-            },
-            "200": {
-                "title": "Sample 2",
-                "source_name": "Ileum",
-                "organism": "Homo sapiens",
-                "characteristics": [
-                    "disease: ulcerative colitis",
-                ],
-                "gpl": "GPL24676",
-            },
-        }
-    }
+    response.content = gzip.compress(soft)
+    response.raise_for_status.return_value = None
 
-    session.get.return_value = response
-
-    result = _fetch_sample_summaries(
-        [
-            "100",
-            "200",
-        ],
-        timeout=10.0,
-        session=session,
-    )
-
-    assert result == [
-        {
-            "gsm_id": "100",
-            "title": "Sample 1",
-            "summary": None,
-            "source_name": "Colon",
-            "organism": "Homo sapiens",
-            "characteristics": [
-                "disease: Crohn disease",
-            ],
-            "platform": "GPL24676",
-        },
-        {
-            "gsm_id": "200",
-            "title": "Sample 2",
-            "summary": None,
-            "source_name": "Ileum",
-            "organism": "Homo sapiens",
-            "characteristics": [
-                "disease: ulcerative colitis",
-            ],
-            "platform": "GPL24676",
-        },
-    ]
-
-    session.get.assert_called_once()
-
-    kwargs = session.get.call_args.kwargs
-
-    assert kwargs["params"] == {
-        "db": "gds",
-        "id": "100,200",
-        "retmode": "json",
-    }
-
-    assert kwargs["timeout"] == 10.0
-
-
-def test_fetch_sample_summaries_skips_missing_records() -> None:
-    session = Mock()
-
-    response = Mock()
-    response.json.return_value = {
-        "result": {
-            "uids": ["100"],
-            "100": {
-                "title": "Sample 1",
-            },
-        }
-    }
-
-    session.get.return_value = response
-
-    result = _fetch_sample_summaries(
-        [
-            "100",
-            "200",
-        ],
-        timeout=10.0,
-        session=session,
-    )
-
-    assert result == [
-        {
-            "gsm_id": "100",
-            "title": "Sample 1",
-            "summary": None,
-            "source_name": None,
-            "organism": None,
-            "characteristics": None,
-            "platform": None,
-        }
-    ]
-
-
-def test_get_geo_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
-    find_mock = Mock(return_value="123456")
-
-    summary_mock = Mock(
-        return_value={
-            "title": "Human scRNA-seq",
-            "summary": "IBD study",
-            "overall_design": "Single-cell RNA sequencing",
-            "organism": "Homo sapiens",
-            "taxon": "9606",
-            "gpl": "GPL24676",
-            "n_samples": 2,
-            "samples": [
-                "GSM100",
-                "GSM200",
-            ],
-        }
-    )
-
-    samples_mock = Mock(
-        return_value=[
-            {
-                "gsm_id": "GSM100",
-                "title": "Sample 1",
-            },
-            {
-                "gsm_id": "GSM200",
-                "title": "Sample 2",
-            },
-        ]
-    )
+    get_mock = Mock(return_value=response)
 
     monkeypatch.setattr(
-        "tools.sc_dataset.geo_metadata._find_geo_id",
-        find_mock,
+        "tools.sc_dataset.geo_metadata.requests.get",
+        get_mock,
     )
 
-    monkeypatch.setattr(
-        "tools.sc_dataset.geo_metadata._fetch_summary",
-        summary_mock,
-    )
+    result = get_geo_metadata("gse123456", timeout=12.0)
 
-    monkeypatch.setattr(
-        "tools.sc_dataset.geo_metadata._fetch_sample_summaries",
-        samples_mock,
-    )
+    assert result["gse"]["gse_id"] == "GSE123456"
+    assert result["gse"]["n_samples"] == 1
+    assert result["samples"][0]["gsm_id"] == "GSM123456"
 
-    result = get_geo_metadata(
-        "gse123456",
-        timeout=15.0,
-    )
+    get_mock.assert_called_once()
 
-    assert result == {
-        "gse": {
-            "gse_id": "GSE123456",
-            "title": "Human scRNA-seq",
-            "summary": "IBD study",
-            "overall_design": "Single-cell RNA sequencing",
-            "organism": "Homo sapiens",
-            "taxon": "9606",
-            "platform": "GPL24676",
-            "n_samples": 2,
-        },
-        "samples": [
-            {
-                "gsm_id": "GSM100",
-                "title": "Sample 1",
-            },
-            {
-                "gsm_id": "GSM200",
-                "title": "Sample 2",
-            },
-        ],
-    }
+    args, kwargs = get_mock.call_args
 
-    find_mock.assert_called_once()
-    summary_mock.assert_called_once()
-    samples_mock.assert_called_once()
+    assert args[0] == _get_soft_url("GSE123456")
+    assert kwargs["timeout"] == 12.0
+    assert kwargs["headers"]["User-Agent"] == ("hermes-work/sc-dataset-qualification")
 
 
 @pytest.mark.parametrize(
     "accession",
-    [
-        "",
-        "GSM123456",
-        "GPL123",
-        "123456",
-    ],
+    ["", "GSM123456", "GSEabc", "123"],
 )
-def test_get_geo_metadata_rejects_invalid_accession(
-    accession: str,
-) -> None:
-    with pytest.raises(
-        ValueError,
-        match="Expected a GSE accession",
-    ):
+def test_get_geo_metadata_rejects_invalid_accession_before_request(
+    monkeypatch,
+    accession,
+):
+    get_mock = Mock()
+
+    monkeypatch.setattr(
+        "tools.sc_dataset.geo_metadata.requests.get",
+        get_mock,
+    )
+
+    with pytest.raises(ValueError, match="Invalid GEO Series accession"):
         get_geo_metadata(accession)
 
+    get_mock.assert_not_called()
 
-def test_get_geo_metadata_normalizes_accession(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    find_mock = Mock(return_value="123456")
 
-    summary_mock = Mock(
-        return_value={
-            "title": "Example",
+def test_get_geo_metadata_rejects_invalid_gzip(monkeypatch):
+    response = Mock()
+    response.content = b"not gzip"
+    response.raise_for_status.return_value = None
+
+    monkeypatch.setattr(
+        "tools.sc_dataset.geo_metadata.requests.get",
+        Mock(return_value=response),
+    )
+
+    with pytest.raises(ValueError, match="not a valid gzip file"):
+        get_geo_metadata("GSE123456")
+
+
+def test_get_geo_metadata_propagates_http_errors(monkeypatch):
+    response = Mock()
+    response.raise_for_status.side_effect = requests.HTTPError("failed")
+
+    monkeypatch.setattr(
+        "tools.sc_dataset.geo_metadata.requests.get",
+        Mock(return_value=response),
+    )
+
+    with pytest.raises(requests.HTTPError, match="failed"):
+        get_geo_metadata("GSE123456")
+
+
+def test_get_geo_metadata_rejects_valid_gzip_without_samples(monkeypatch):
+    soft = b"^SERIES = GSE123456\n!Series_title = No samples\n"
+
+    response = Mock()
+    response.content = gzip.compress(soft)
+    response.raise_for_status.return_value = None
+
+    monkeypatch.setattr(
+        "tools.sc_dataset.geo_metadata.requests.get",
+        Mock(return_value=response),
+    )
+
+    with pytest.raises(ValueError, match="No GSM sample records"):
+        get_geo_metadata("GSE123456")
+
+
+def test_cli_outputs_json(monkeypatch):
+    monkeypatch.setattr(
+        "tools.sc_dataset.geo_metadata.get_geo_metadata",
+        lambda accession, timeout: {
+            "gse": {"gse_id": accession},
             "samples": [],
-        }
+        },
     )
 
-    samples_mock = Mock(return_value=[])
+    result = CliRunner().invoke(main, ["GSE123456", "--pretty"])
 
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {
+        "gse": {"gse_id": "GSE123456"},
+        "samples": [],
+    }
+
+
+def test_cli_converts_expected_errors_to_click_exception(monkeypatch):
     monkeypatch.setattr(
-        "tools.sc_dataset.geo_metadata._find_geo_id",
-        find_mock,
+        "tools.sc_dataset.geo_metadata.get_geo_metadata",
+        Mock(side_effect=ValueError("bad accession")),
     )
 
+    result = CliRunner().invoke(main, ["GSE123456"])
+
+    assert result.exit_code != 0
+    assert "bad accession" in result.output
+
+
+def test_cli_converts_http_errors_to_click_exception(monkeypatch):
     monkeypatch.setattr(
-        "tools.sc_dataset.geo_metadata._fetch_summary",
-        summary_mock,
+        "tools.sc_dataset.geo_metadata.get_geo_metadata",
+        Mock(side_effect=requests.HTTPError("network failure")),
     )
 
-    monkeypatch.setattr(
-        "tools.sc_dataset.geo_metadata._fetch_sample_summaries",
-        samples_mock,
-    )
+    result = CliRunner().invoke(main, ["GSE123456"])
 
-    result = get_geo_metadata("  gse123456  ")
-
-    assert result["gse"]["gse_id"] == "GSE123456"
-
-    find_mock.assert_called_once()
-
-    assert find_mock.call_args.args[0] == "GSE123456"
+    assert result.exit_code != 0
+    assert "network failure" in result.output

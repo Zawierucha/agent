@@ -1,15 +1,99 @@
 from __future__ import annotations
 
 import json
-import sys
+import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import click
 import requests
 
-
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+RETRYABLE_STATUSES = {403, 429, 500, 502, 503, 504}
+
+
+class SearchRequestError(RuntimeError):
+    """Raised when a request fails after bounded retries."""
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+
+    try:
+        return max(0, int(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+        except (OSError, TypeError, ValueError, OverflowError):
+            return None
+
+
+def _get_json(
+    session: requests.Session,
+    url: str,
+    params: dict[str, Any],
+    *,
+    timeout: float,
+    max_attempts: int = 4,
+    sleep=time.sleep,
+) -> Any:
+    """GET JSON with bounded retries for transient NCBI/request failures."""
+
+    last_status: int | None = None
+    last_error: (
+        requests.exceptions.ConnectionError | requests.exceptions.Timeout | None
+    ) = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = session.get(url, params=params, timeout=timeout)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            last_error = exc
+            last_status = None
+            if attempt == max_attempts:
+                raise SearchRequestError(
+                    f"Request to {url} failed after {max_attempts} attempts; "
+                    f"last error: {type(exc).__name__}: {exc}"
+                ) from exc
+            sleep(min(2 ** (attempt - 1), 30))
+            continue
+
+        status = response.status_code
+        if status >= 400 and status not in RETRYABLE_STATUSES:
+            raise requests.HTTPError(f"HTTP {status} for {url}", response=response)
+
+        if status in RETRYABLE_STATUSES:
+            last_status = status
+            last_error = None
+            if attempt == max_attempts:
+                raise SearchRequestError(
+                    f"Request to {url} failed after {max_attempts} attempts; "
+                    f"last status: {status}"
+                )
+            delay = _retry_after_seconds(response.headers.get("Retry-After"))
+            sleep(delay if delay is not None else min(2 ** (attempt - 1), 30))
+            continue
+
+        return response.json()
+
+    # max_attempts is a public helper argument, but the normal path raises above.
+    detail = (
+        f"last status: {last_status}"
+        if last_status is not None
+        else f"last error: {type(last_error).__name__}"
+    )
+    raise SearchRequestError(
+        f"Request to {url} failed after {max_attempts} attempts; {detail}"
+    )
 
 
 def _search_geo_ids(
@@ -18,10 +102,12 @@ def _search_geo_ids(
     max_results: int,
     timeout: float,
     session: requests.Session,
-) -> list[str]:
-    """Search NCBI GEO and return GEO record IDs."""
+    sleep=time.sleep,
+) -> tuple[list[str], int | None]:
+    """Search NCBI GEO and return record IDs and the reported count."""
 
-    response = session.get(
+    data = _get_json(
+        session,
         ESEARCH_URL,
         params={
             "db": "gds",
@@ -30,12 +116,15 @@ def _search_geo_ids(
             "retmode": "json",
         },
         timeout=timeout,
+        sleep=sleep,
     )
-    response.raise_for_status()
+    esearchresult = data["esearchresult"]
+    try:
+        count = int(esearchresult["count"])
+    except (KeyError, TypeError, ValueError):
+        count = None
 
-    data = response.json()
-
-    return data["esearchresult"]["idlist"]
+    return esearchresult["idlist"], count
 
 
 def _fetch_geo_records(
@@ -43,13 +132,15 @@ def _fetch_geo_records(
     *,
     timeout: float,
     session: requests.Session,
+    sleep=time.sleep,
 ) -> list[dict[str, Any]]:
     """Fetch GEO summaries for NCBI GEO record IDs."""
 
     if not ids:
         return []
 
-    response = session.get(
+    data = _get_json(
+        session,
         ESUMMARY_URL,
         params={
             "db": "gds",
@@ -57,10 +148,8 @@ def _fetch_geo_records(
             "retmode": "json",
         },
         timeout=timeout,
+        sleep=sleep,
     )
-    response.raise_for_status()
-
-    data = response.json()
     result = data["result"]
 
     records: list[dict[str, Any]] = []
@@ -88,7 +177,8 @@ def _extract_gse(record: dict[str, Any]) -> str | None:
 
     if isinstance(title, str):
         for token in title.split():
-            if token.startswith("GSE") and token[3:].isdigit():
+            token = token.rstrip(",.;:)")
+            if token.startswith("GSE") and token[3:].isascii() and token[3:].isdigit():
                 return token.rstrip(",.;:)")
 
     return None
@@ -150,15 +240,9 @@ def search_geo(
     *,
     max_results_per_query: int = 100,
     timeout: float = 30.0,
-) -> list[dict[str, Any]]:
-    """Search NCBI GEO using arbitrary queries.
-
-    This function contains no domain-specific search terminology.
-    The caller is responsible for constructing the queries.
-    """
-
-    if not queries:
-        return []
+    sleep=time.sleep,
+) -> dict[str, Any]:
+    """Search NCBI GEO and return per-query reports and deduplicated records."""
 
     cleaned_queries = list(
         dict.fromkeys(
@@ -167,11 +251,12 @@ def search_geo(
             if isinstance(query, str) and query.strip()
         )
     )
-
     if not cleaned_queries:
-        return []
+        return {"queries": [], "records": [], "dropped_no_gse": 0}
 
+    reports: list[dict[str, Any]] = []
     all_records: list[dict[str, Any]] = []
+    dropped_no_gse = 0
 
     with requests.Session() as session:
         session.headers.update(
@@ -181,28 +266,63 @@ def search_geo(
         )
 
         for query in cleaned_queries:
-            ids = _search_geo_ids(
-                query,
-                max_results=max_results_per_query,
-                timeout=timeout,
-                session=session,
-            )
-
-            records = _fetch_geo_records(
-                ids,
-                timeout=timeout,
-                session=session,
-            )
-
-            all_records.extend(
-                _normalize_record(
-                    record,
-                    query=query,
+            count: int | None = None
+            ids: list[str] | None = None
+            try:
+                ids, count = _search_geo_ids(
+                    query,
+                    max_results=max_results_per_query,
+                    timeout=timeout,
+                    session=session,
+                    sleep=sleep,
                 )
-                for record in records
+                raw_records = (
+                    _fetch_geo_records(
+                        ids,
+                        timeout=timeout,
+                        session=session,
+                        sleep=sleep,
+                    )
+                    if ids
+                    else []
+                )
+                normalized = [
+                    _normalize_record(record, query=query) for record in raw_records
+                ]
+                dropped_no_gse += sum(not record["gse_id"] for record in normalized)
+                all_records.extend(normalized)
+                retrieved = len(ids)
+                status = (
+                    "partial" if count is not None and count > retrieved else "success"
+                )
+                error = None
+            except (
+                SearchRequestError,
+                requests.HTTPError,
+                requests.RequestException,
+                ValueError,
+                KeyError,
+                TypeError,
+            ) as exc:
+                status = "failed"
+                retrieved = len(ids) if ids is not None else 0
+                error = f"{type(exc).__name__}: {exc}"
+
+            reports.append(
+                {
+                    "query": query,
+                    "status": status,
+                    "count": count,
+                    "retrieved": retrieved,
+                    "error": error,
+                }
             )
 
-    return _deduplicate_gses(all_records)
+    return {
+        "queries": reports,
+        "records": _deduplicate_gses(all_records),
+        "dropped_no_gse": dropped_no_gse,
+    }
 
 
 @click.command()
@@ -217,7 +337,7 @@ def search_geo(
     "--max-results",
     default=100,
     show_default=True,
-    type=click.IntRange(min=1),
+    type=click.IntRange(min=1, max=10000),
     help="Maximum number of results per query.",
 )
 @click.option(
