@@ -1,15 +1,22 @@
 from __future__ import annotations
 
-
-import json
-import re
-
+import sys
 from pathlib import Path
 
+_TOOL_IMPORT_ROOT = Path(__file__).resolve().parents[2]
+if not any((_candidate / 'tools').is_dir() for _candidate in map(Path, sys.path)):
+    sys.path.insert(0, str(_TOOL_IMPORT_ROOT))
+
+
+import hashlib
+import json
+import re
+from datetime import datetime
+from pathlib import Path
 
 import click
-
 import duckdb
+from tools.sc_dataset.geo_envelope import canonical_json_bytes
 
 DEFAULT_DB = Path("data/geo.duckdb")
 
@@ -21,6 +28,118 @@ def get_connection(db_path: Path) -> duckdb.DuckDBPyConnection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     return duckdb.connect(str(db_path))
+
+
+class _PreflightRefusal(Exception):
+    def __init__(self, error_class: str, detail: str | None = None, exit_code: int = 1):
+        self.error_class = error_class
+        self.detail = detail
+        self.exit_code = exit_code
+        super().__init__(error_class)
+
+
+def _load_preflight_grant(
+    preflight: Path | None, gse_id: str, gsm_id: str | None = None
+) -> tuple[dict, Path]:
+    if preflight is None:
+        raise _PreflightRefusal("preflight_required")
+    try:
+        grant = json.loads(preflight.read_text(encoding="utf-8"))
+        required = {
+            "schema", "gse_id", "run_id", "expected_gsm_ids", "parsed_sha256",
+            "raw_sha256", "issued_at_utc", "grant_sha256",
+        }
+        if not isinstance(grant, dict) or set(grant) != required:
+            raise ValueError("grant fields do not match grant-v1")
+        if grant["schema"] != "grant-v1":
+            raise ValueError("unsupported grant schema")
+        if (
+            not isinstance(grant["gse_id"], str)
+            or not re.fullmatch(r"GSE\d+", grant["gse_id"])
+            or not isinstance(grant["run_id"], str)
+            or not grant["run_id"]
+        ):
+            raise TypeError("invalid grant identity")
+        expected = grant["expected_gsm_ids"]
+        if (
+            not isinstance(expected, list)
+            or any(not isinstance(item, str) or not re.fullmatch(r"GSM\d+", item) for item in expected)
+            or expected != sorted(set(expected))
+        ):
+            raise ValueError("invalid expected GSM list")
+        for name in ("parsed_sha256", "raw_sha256", "grant_sha256"):
+            if not isinstance(grant[name], str) or not re.fullmatch(r"[0-9a-f]{64}", grant[name]):
+                raise ValueError(f"invalid {name}")
+        if not isinstance(grant["issued_at_utc"], str) or not grant["issued_at_utc"].endswith("Z"):
+            raise ValueError("invalid grant timestamp")
+        timestamp = datetime.fromisoformat(grant["issued_at_utc"])
+        if timestamp.utcoffset() is None or timestamp.utcoffset().total_seconds() != 0:
+            raise ValueError("grant timestamp must be UTC")
+        payload = {key: value for key, value in grant.items() if key != "grant_sha256"}
+        if hashlib.sha256(canonical_json_bytes(payload)).hexdigest() != grant["grant_sha256"]:
+            raise ValueError("grant self-hash mismatch")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise _PreflightRefusal("grant_invalid", str(exc)) from exc
+
+    if grant["gse_id"] != gse_id:
+        raise _PreflightRefusal("grant_gse_mismatch")
+    if gsm_id is not None and gsm_id not in grant["expected_gsm_ids"]:
+        raise _PreflightRefusal("gsm_not_expected")
+
+    run_dir = preflight.parent.parent
+    try:
+        parsed_hash = hashlib.sha256(
+            (run_dir / "metadata_parsed" / f"{gse_id}.json").read_bytes()
+        ).hexdigest()
+        raw_hash = hashlib.sha256(
+            (run_dir / "metadata_raw" / f"{gse_id}.soft.gz").read_bytes()
+        ).hexdigest()
+    except OSError as exc:
+        raise _PreflightRefusal("grant_stale_artifact", str(exc)) from exc
+    if parsed_hash != grant["parsed_sha256"] or raw_hash != grant["raw_sha256"]:
+        raise _PreflightRefusal("grant_stale_artifact")
+    return grant, run_dir
+
+
+def _report_preflight_refusal(refusal: _PreflightRefusal) -> None:
+    report = {"error_class": refusal.error_class}
+    if refusal.detail is not None:
+        report["detail"] = refusal.detail
+    click.echo(json.dumps(report, ensure_ascii=False))
+    raise click.exceptions.Exit(refusal.exit_code)
+
+
+def _check_sample_ownership(
+    connection: duckdb.DuckDBPyConnection,
+    gsm_id: str,
+    gse_id: str,
+    *,
+    require_existing: bool = False,
+) -> None:
+    row = connection.execute("SELECT gse_id FROM geo_samples WHERE gsm_id=?", [gsm_id]).fetchone()
+    if row is None:
+        if require_existing:
+            raise _PreflightRefusal("sample_missing")
+        return
+    if row[0] not in (None, gse_id):
+        raise _PreflightRefusal("ownership_conflict", exit_code=2)
+
+
+def _recheck_artifacts(preflight: Path | None, grant: dict) -> None:
+    assert preflight is not None
+    run_dir = preflight.parent.parent
+    gse_id = grant["gse_id"]
+    try:
+        parsed_hash = hashlib.sha256(
+            (run_dir / "metadata_parsed" / f"{gse_id}.json").read_bytes()
+        ).hexdigest()
+        raw_hash = hashlib.sha256(
+            (run_dir / "metadata_raw" / f"{gse_id}.soft.gz").read_bytes()
+        ).hexdigest()
+    except OSError as exc:
+        raise _PreflightRefusal("grant_stale_artifact", str(exc)) from exc
+    if parsed_hash != grant["parsed_sha256"] or raw_hash != grant["raw_sha256"]:
+        raise _PreflightRefusal("grant_stale_artifact")
 
 
 def load_schema(
@@ -918,6 +1037,10 @@ def init_command(
 
 @cli.command("save-dataset")
 @click.argument("gse_id")
+@click.option(
+    "--preflight", type=click.Path(path_type=Path), required=False,
+    help="Required grant-v1 token; missing token is refused before database access.",
+)
 @click.option("--title")
 @click.option("--summary")
 @click.option("--overall-design")
@@ -928,6 +1051,7 @@ def init_command(
 def save_dataset_command(
     ctx: click.Context,
     gse_id: str,
+    preflight: Path | None,
     title: str | None,
     summary: str | None,
     overall_design: str | None,
@@ -936,10 +1060,17 @@ def save_dataset_command(
     n_samples: int | None,
 ) -> None:
 
-    connection = get_connection(ctx.obj["db"])
-
     try:
+        grant, _run_dir = _load_preflight_grant(preflight, gse_id)
+    except _PreflightRefusal as refusal:
+        _report_preflight_refusal(refusal)
 
+    connection = get_connection(ctx.obj["db"])
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        _recheck_artifacts(preflight, grant)
+        for expected_gsm in grant["expected_gsm_ids"]:
+            _check_sample_ownership(connection, expected_gsm, gse_id)
         save_dataset(
             connection,
             gse_id,
@@ -950,9 +1081,18 @@ def save_dataset_command(
             platform,
             n_samples,
         )
-
-    finally:
-
+        connection.execute("COMMIT")
+    except _PreflightRefusal as refusal:
+        connection.execute("ROLLBACK")
+        connection.close()
+        _report_preflight_refusal(refusal)
+    except Exception:
+        try:
+            connection.execute("ROLLBACK")
+        finally:
+            connection.close()
+        raise
+    else:
         connection.close()
 
     click.echo(f"Saved dataset: {gse_id}")
@@ -960,6 +1100,10 @@ def save_dataset_command(
 
 @cli.command("save-sample")
 @click.argument("gsm_id")
+@click.option(
+    "--preflight", type=click.Path(path_type=Path), required=False,
+    help="Required grant-v1 token; missing token is refused before database access.",
+)
 @click.option("--gse-id", required=True)
 @click.option("--title")
 @click.option("--summary")
@@ -979,6 +1123,7 @@ def save_dataset_command(
 def save_sample_command(
     ctx: click.Context,
     gsm_id: str,
+    preflight: Path | None,
     gse_id: str,
     title: str | None,
     summary: str | None,
@@ -993,10 +1138,16 @@ def save_sample_command(
     is_longitudinal: bool | None,
 ) -> None:
 
-    connection = get_connection(ctx.obj["db"])
-
     try:
+        _grant, _run_dir = _load_preflight_grant(preflight, gse_id, gsm_id)
+    except _PreflightRefusal as refusal:
+        _report_preflight_refusal(refusal)
 
+    connection = get_connection(ctx.obj["db"])
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        _recheck_artifacts(preflight, _grant)
+        _check_sample_ownership(connection, gsm_id, gse_id)
         parsed_characteristics = None
 
         if characteristics:
@@ -1033,12 +1184,66 @@ def save_sample_command(
                 gsm_id,
                 parsed_characteristics,
             )
-
-    finally:
-
+        connection.execute("COMMIT")
+    except _PreflightRefusal as refusal:
+        connection.execute("ROLLBACK")
+        connection.close()
+        _report_preflight_refusal(refusal)
+    except Exception:
+        try:
+            connection.execute("ROLLBACK")
+        finally:
+            connection.close()
+        raise
+    else:
         connection.close()
 
     click.echo(f"Saved sample: {gsm_id}")
+
+
+@cli.command("save-characteristics")
+@click.argument("gsm_id")
+@click.option(
+    "--preflight", type=click.Path(path_type=Path), required=False,
+    help="Required grant-v1 token; missing token is refused before database access.",
+)
+@click.option("--gse-id", required=True)
+@click.option("--characteristics", required=True)
+@click.pass_context
+def save_characteristics_command(
+    ctx: click.Context, gsm_id: str, preflight: Path | None, gse_id: str, characteristics: str
+) -> None:
+    try:
+        __grant, _run_dir = _load_preflight_grant(preflight, gse_id, gsm_id)
+        parsed = json.loads(characteristics)
+        if not isinstance(parsed, dict):
+            raise TypeError("characteristics must be a JSON object")
+    except _PreflightRefusal as refusal:
+        _report_preflight_refusal(refusal)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        click.echo(json.dumps({"error_class": "invalid_characteristics", "detail": str(exc)}))
+        raise click.exceptions.Exit(1) from exc
+
+    connection = get_connection(ctx.obj["db"])
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        _recheck_artifacts(preflight, __grant)
+        _check_sample_ownership(connection, gsm_id, gse_id, require_existing=True)
+        save_characteristics(connection, gsm_id, parsed)
+        connection.execute("COMMIT")
+    except _PreflightRefusal as refusal:
+        connection.execute("ROLLBACK")
+        connection.close()
+        _report_preflight_refusal(refusal)
+    except Exception:
+        try:
+            connection.execute("ROLLBACK")
+        finally:
+            connection.close()
+        raise
+    else:
+        connection.close()
+    click.echo(f"Saved characteristics: {gsm_id}")
 
 
 @cli.command("get-dataset")

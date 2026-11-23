@@ -1,0 +1,74 @@
+{
+  "envelope": {
+    "created_at_utc": "2026-11-23T17:05:00Z",
+    "envelope_version": "1.0",
+    "execution_identity": {
+      "identity_version": "exec-identity-v1",
+      "qualification_criteria": null,
+      "search_scope": {
+        "payload_version": "scope-fp-v1",
+        "sha256": "6ad13eccfa88e98319f4cd8ca2102bec00f7cdf0e308222454e7bc71cb01d0b3"
+      }
+    },
+    "handoff": {
+      "allowed_to_proceed": "complete",
+      "content_sha256": "bad",
+      "created_at_utc": "2026-11-23T17:20:02Z",
+      "excluded": [],
+      "found_count": 1,
+      "from_stage": "search",
+      "hash_version": "handoff-payload-v1",
+      "to_stage": "qualification",
+      "transferred_gse_ids": []
+    },
+    "resume": {
+      "attempt": 1,
+      "resumed_from_run_id": null
+    },
+    "run_id": "20261123T170500Z-3f9a1c2e",
+    "sealed_at_utc": null,
+    "search": {
+      "errors": [],
+      "finished_at_utc": "2026-11-23T17:12:41Z",
+      "limits": {
+        "retstart_pagination": false
+      },
+      "params": {
+        "queries": [
+          {
+            "max_results": 10,
+            "query": "alpha",
+            "query_id": "q1"
+          }
+        ],
+        "species_constraint": "human"
+      },
+      "per_query": [
+        {
+          "attempt": 1,
+          "count": 1,
+          "query_id": "q1",
+          "retrieved": 1,
+          "status": "success"
+        }
+      ],
+      "results": {
+        "dropped_no_gse": 0,
+        "gse_ids": [
+          "GSE1"
+        ],
+        "unique_gse_count": 1
+      },
+      "skill": {
+        "name": "sc-dataset-search",
+        "version": "0.5.0"
+      },
+      "status": "COMPLETE",
+      "tool": "geo_search.py",
+      "tool_version": "1.1.0",
+      "warnings": []
+    }
+  },
+  "expected_error": "E_HANDOFF_V4",
+  "stage": "handoff"
+}
