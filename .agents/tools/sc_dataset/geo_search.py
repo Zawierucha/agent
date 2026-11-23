@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 import click
 import requests
+from tools.sc_dataset.geo_envelope import (
+    derive_search_status,
+    envelope_skeleton,
+    new_run_id,
+    utc_now,
+    write_envelope_atomic,
+)
+
+TOOL_VERSION = "1.1.0"
 
 ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
 ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
@@ -326,6 +338,9 @@ def search_geo(
 
 
 @click.command()
+@click.option("--run-id", default=None, help="Execution envelope run identifier.")
+@click.option("--output-envelope", type=click.Path(path_type=Path), default=None, help="Write an execution envelope JSON file.")
+@click.option("--skill-version", default=None, help="Search skill version (or SC_DATASET_SEARCH_VERSION).")
 @click.option(
     "--query",
     "queries",
@@ -353,6 +368,9 @@ def search_geo(
     help="Pretty-print JSON output.",
 )
 def main(
+    run_id: str | None,
+    output_envelope: Path | None,
+    skill_version: str | None,
     queries: tuple[str, ...],
     max_results: int,
     timeout: float,
@@ -360,11 +378,73 @@ def main(
 ) -> None:
     """Search NCBI GEO using arbitrary search queries."""
 
-    results = search_geo(
-        list(queries),
-        max_results_per_query=max_results,
-        timeout=timeout,
-    )
+    if output_envelope is None:
+        results = search_geo(
+            list(queries),
+            max_results_per_query=max_results,
+            timeout=timeout,
+        )
+    else:
+        cleaned = list(dict.fromkeys(query.strip() for query in queries if query.strip()))
+        query_reports: dict[str, dict[str, Any]] = {}
+        all_records: list[dict[str, Any]] = []
+        dropped_no_gse = 0
+        reports: list[dict[str, Any]] = []
+        aborted = False
+        if not cleaned:
+            results = {"queries": [], "records": [], "dropped_no_gse": 0}
+        for index, query in enumerate(cleaned, 1):
+            try:
+                partial = search_geo(
+                    [query],
+                    max_results_per_query=max_results,
+                    timeout=timeout,
+                )
+                row = partial["queries"][0] if partial.get("queries") else {"query": query, "status": "success", "count": 0, "retrieved": 0, "error": None}
+                query_reports[query] = row
+                if row.get("status") == "not_run":
+                    aborted = True
+                    break
+                reports.append(row)
+                all_records.extend(partial["records"])
+                dropped_no_gse += partial["dropped_no_gse"]
+            except (SearchRequestError, requests.RequestException, ValueError, KeyError, TypeError, RuntimeError) as exc:
+                row = {"query": query, "status": "failed", "count": None, "retrieved": 0, "error": f"{type(exc).__name__}: {exc}"}
+                query_reports[query] = row
+                reports.append(row)
+                for remaining in cleaned[index:]:
+                    query_reports[remaining] = {"query": remaining, "status": "not_run"}
+                break
+        results = {"queries": reports, "records": _deduplicate_gses(all_records), "dropped_no_gse": dropped_no_gse}
+    if output_envelope is not None:
+        actual_run_id = run_id or new_run_id()
+        if not re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{8}", actual_run_id):
+            raise click.BadParameter("run_id must match YYYYMMDDTHHMMSSZ-<8 lowercase hex>", param_hint="--run-id")
+        actual_skill_version = skill_version or os.environ.get("SC_DATASET_SEARCH_VERSION", "unknown")
+        params = {"queries": [{"query_id": f"q{index}", "query": query, "max_results": max_results} for index, query in enumerate(cleaned, 1)], "species_constraint": "Homo sapiens [Organism]"}
+        limits = {"retstart_pagination": False, "max_results_per_query": max_results}
+        env = envelope_skeleton(actual_run_id, utc_now(), {"name": "sc-dataset-search", "version": actual_skill_version}, "geo_search.py", TOOL_VERSION, params, limits)
+        per_query = []
+        errors = []
+        for planned in params["queries"]:
+            row = query_reports.get(planned["query"])
+            if row is not None and row.get("status") == "not_run":
+                aborted = True
+                row = None
+            if row is None or aborted:
+                per_query.append({"query_id": planned["query_id"], "status": "not_run", "count": None, "retrieved": 0, "error": "run aborted before this query", "substituted_query": None, "attempt": 1})
+            else:
+                per_query.append({"query_id": planned["query_id"], "status": row["status"], "count": row["count"], "retrieved": row["retrieved"], "error": row["error"], "substituted_query": None, "attempt": 1})
+                if row.get("error"):
+                    errors.append({"query_id": planned["query_id"], "message": row["error"]})
+        status = derive_search_status([q["query_id"] for q in params["queries"]], per_query)
+        if status == "FAILED" and (not per_query or all(row["status"] == "not_run" for row in per_query)):
+            errors.append({"code": "no_queries_attempted", "message": "no planned query was attempted"})
+        gse_ids = [record["gse_id"] for record in results.get("records", []) if isinstance(record.get("gse_id"), str)]
+        env["search"].update({"status": status, "per_query": per_query, "results": {"unique_gse_count": len(set(gse_ids)), "gse_ids": list(dict.fromkeys(gse_ids)), "dropped_no_gse": results.get("dropped_no_gse", 0)}, "errors": errors, "finished_at_utc": utc_now()})
+        write_envelope_atomic(output_envelope, env)
+        results["run_id"] = actual_run_id
+        results["envelope_path"] = str(output_envelope)
 
     if pretty:
         click.echo(

@@ -5,7 +5,6 @@ from unittest.mock import Mock
 import pytest
 import requests
 from click.testing import CliRunner
-
 from tools.sc_dataset.geo_metadata import (
     GEO_FTP_URL,
     _get_soft_url,
@@ -26,11 +25,30 @@ def test_get_soft_url_builds_expected_url():
 
 @pytest.mark.parametrize(
     "accession",
-    ["GSE12", "GSE", "GSM123", "abc", "GSE12x"],
+    ["GSE", "GSM123", "abc", "GSE12x"],
 )
 def test_get_soft_url_rejects_invalid_accession(accession):
     with pytest.raises(ValueError, match="Invalid GEO Series accession"):
         _get_soft_url(accession)
+
+
+@pytest.mark.parametrize(
+    ("accession", "bucket"),
+    [
+        ("GSE12", "GSEnnn"),  # below 1000 -> GSEnnn bucket (ETAP 3 decision)
+        ("GSE9686", "GSE9nnn"),  # 9000-range boundary
+        ("GSE1000", "GSE1nnn"),  # 1000-range lower edge
+        ("GSE10191", "GSE10nnn"),  # 10000-range
+        ("GSE346721", "GSE346nnn"),  # standard modern accession
+    ],
+)
+def test_get_soft_url_accepts_and_builds_exact_soft_url(
+    accession: str, bucket: str
+) -> None:
+    url = _get_soft_url(accession)
+    assert url == (
+        f"{GEO_FTP_URL}/{bucket}/{accession}/soft/{accession}_family.soft.gz"
+    )
 
 
 def test_parse_soft_value_strips_whitespace_and_quotes():
@@ -328,3 +346,66 @@ def test_cli_converts_http_errors_to_click_exception(monkeypatch):
 
     assert result.exit_code != 0
     assert "network failure" in result.output
+
+
+
+def test_parse_empty_super_series_has_confirmed_classification():
+    from tools.sc_dataset.geo_metadata import _classify_empty_soft
+
+    assert _classify_empty_soft(
+        "^SERIES = GSE123456\n!Series_type = SuperSeries\n"
+    ) == "confirmed_superseries"
+
+
+def test_parse_empty_series_with_listed_gsms_is_truncated():
+    from tools.sc_dataset.geo_metadata import _classify_empty_soft
+
+    assert _classify_empty_soft(
+        "^SERIES = GSE123456\n!Series_sample_id = GSM1\n"
+    ) == "truncated_soft"
+
+
+def test_parse_empty_unexpected_series_is_permanent_class():
+    from tools.sc_dataset.geo_metadata import _classify_empty_soft
+
+    assert _classify_empty_soft("^SERIES = GSE123456\n") == "no_samples_unexpected"
+
+
+def test_get_geo_metadata_back_compat_shape_and_single_request(monkeypatch):
+    response = Mock()
+    response.content = gzip.compress(
+        b"^SERIES = GSE123456\n^SAMPLE = GSM1\n!Sample_title = Example\n"
+    )
+    response.raise_for_status.return_value = None
+    request = Mock(return_value=response)
+    monkeypatch.setattr("tools.sc_dataset.geo_metadata.requests.get", request)
+
+    result = get_geo_metadata("GSE123456")
+
+    assert set(result) == {"gse", "samples"}
+    request.assert_called_once()
+
+
+def test_parse_empty_series_relation_classifies_superseries():
+    from tools.sc_dataset.geo_metadata import _classify_empty_soft
+
+    assert _classify_empty_soft(
+        "^SERIES = GSE123456\n!Series_relation = SubSeries of GSE1\n"
+    ) == "confirmed_superseries"
+
+
+def test_late_binding_sleep_default_uses_patched_time_sleep(monkeypatch):
+    import time
+
+    from tools.sc_dataset.geo_metadata import get_geo_metadata
+
+    delays = []
+    monkeypatch.setattr(time, "sleep", delays.append)
+    response = Mock(status_code=429, headers={})
+    error = requests.HTTPError("429", response=response)
+    good = Mock(content=gzip.compress(b"^SERIES = GSE1\n^SAMPLE = GSM1\n"), status_code=200)
+    good.raise_for_status.return_value = None
+    get = Mock(side_effect=[error, good])
+    monkeypatch.setattr("tools.sc_dataset.geo_metadata.requests.get", get)
+    get_geo_metadata("GSE123456")
+    assert len(delays) == 1

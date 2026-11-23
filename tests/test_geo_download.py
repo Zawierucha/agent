@@ -7,7 +7,6 @@ from unittest.mock import Mock
 import duckdb
 import pytest
 import requests
-
 from tools.sc_dataset import geo_download as downloader
 
 
@@ -154,7 +153,7 @@ def test_download_one_removes_partial_file_after_failure(tmp_path: Path, monkeyp
 def test_run_gse_dry_run_writes_no_manifest_or_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db = tmp_path / "catalog.duckdb"
     create_catalog(db)
-    monkeypatch.setattr(downloader, "list_files", lambda gse, timeout: ("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE123nnn/GSE123456/suppl/", [{"filename": "x.txt", "source_url": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE123nnn/GSE123456/suppl/x.txt", "listed_size_bytes": 3}]))
+    monkeypatch.setattr(downloader, "list_files", lambda gse, timeout, retries: ("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE123nnn/GSE123456/suppl/", [{"filename": "x.txt", "source_url": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE123nnn/GSE123456/suppl/x.txt", "listed_size_bytes": 3}]))
     result = downloader.run_gse(db, tmp_path / "downloads", "GSE123456", 10, 0, False)
     assert result["dry_run"] is True
     assert result["source_file_count"] == 1

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 
 import duckdb
 import pytest
-
+from click.testing import CliRunner
+from conftest import (
+    REPO_ROOT,
+    _assert_database_unchanged,
+    make_geo_db,
+)
 from tools.sc_dataset.geo_database import (
     catalog_report,
+    cli,
     get_connection,
     get_dataset,
     get_samples,
@@ -17,82 +25,8 @@ from tools.sc_dataset.geo_database import (
 
 
 @pytest.fixture
-def db(tmp_path):
-    db_path = tmp_path / "geo.duckdb"
-
-    connection = duckdb.connect(str(db_path))
-
-    connection.execute(
-        """
-        CREATE TABLE geo_datasets (
-            gse_id          VARCHAR PRIMARY KEY,
-            title           VARCHAR,
-            summary         VARCHAR,
-            overall_design  VARCHAR,
-            organism        VARCHAR,
-            platform        VARCHAR,
-            n_samples       INTEGER,
-            discovered_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE geo_samples (
-            gsm_id           VARCHAR PRIMARY KEY,
-            gse_id           VARCHAR NOT NULL,
-            title            VARCHAR,
-            summary          VARCHAR,
-            source_name      VARCHAR,
-            organism         VARCHAR,
-            platform         VARCHAR,
-            characteristics  JSON,
-            patient_id       VARCHAR,
-            timepoint        VARCHAR,
-            timepoint_value  VARCHAR,
-            timepoint_unit   VARCHAR,
-            is_longitudinal  BOOLEAN,
-            updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE geo_sample_characteristics (
-            gsm_id          VARCHAR NOT NULL,
-            characteristic  VARCHAR NOT NULL,
-            value           VARCHAR,
-            raw_value       VARCHAR,
-            PRIMARY KEY (gsm_id, characteristic)
-        );
-
-        CREATE TABLE geo_sample_metadata (
-            gsm_id              VARCHAR PRIMARY KEY,
-            disease             VARCHAR,
-            health_state        VARCHAR,
-            tissue              VARCHAR,
-            cell_type           VARCHAR,
-            age                 VARCHAR,
-            sex                 VARCHAR,
-            treatment           VARCHAR,
-            treatment_response  VARCHAR
-        );
-
-        CREATE TABLE geo_qualification (
-            gse_id           VARCHAR PRIMARY KEY,
-            qualification    VARCHAR,
-            is_human         BOOLEAN,
-            is_single_cell   BOOLEAN,
-            is_ibd_related   BOOLEAN,
-            disease          VARCHAR,
-            modality         VARCHAR,
-            tissue           VARCHAR,
-            confidence       VARCHAR,
-            evidence         VARCHAR,
-            uncertainties    VARCHAR,
-            qualified_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """
-    )
-
-    connection.close()
-
-    return db_path
+def db(geo_db: Path) -> Path:
+    return geo_db
 
 
 def test_save_and_get_dataset(db):
@@ -237,6 +171,8 @@ def test_save_sample_with_json_characteristics(db):
 def test_save_sample_updates_existing_record(db):
     connection = get_connection(db)
 
+    save_dataset(connection, "GSE001", None, None, None, None, None, None)
+
     save_sample(
         connection,
         "GSM001",
@@ -252,6 +188,11 @@ def test_save_sample_updates_existing_record(db):
         None,
         None,
         True,
+    )
+
+    connection.execute(
+        "DELETE FROM geo_sample_metadata WHERE gsm_id = ?",
+        ["GSM001"],
     )
 
     save_sample(
@@ -293,6 +234,24 @@ def test_save_sample_updates_existing_record(db):
 
 def test_save_arbitrary_characteristics(db):
     connection = get_connection(db)
+
+    save_dataset(connection, "GSE001", None, None, None, None, None, None)
+    save_sample(
+        connection,
+        "GSM001",
+        "GSE001",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 
     save_characteristics(
         connection,
@@ -336,6 +295,24 @@ def test_save_arbitrary_characteristics(db):
 def test_save_characteristics_replaces_existing_values(db):
     connection = get_connection(db)
 
+    save_dataset(connection, "GSE001", None, None, None, None, None, None)
+    save_sample(
+        connection,
+        "GSM001",
+        "GSE001",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
     save_characteristics(
         connection,
         "GSM001",
@@ -378,6 +355,8 @@ def test_save_characteristics_replaces_existing_values(db):
 
 def test_longitudinal_samples(db):
     connection = get_connection(db)
+
+    save_dataset(connection, "GSE001", None, None, None, None, None, None)
 
     samples_to_save = [
         (
@@ -491,3 +470,50 @@ def test_catalog_report(db):
     assert report["total_datasets"] == 2
     assert report["qualifications"]["include"] == 1
     assert report["qualifications"]["uncertain"] == 1
+
+def test_make_geo_db_uses_production_schema(tmp_path: Path) -> None:
+    db_path = make_geo_db(tmp_path / "schema-check.duckdb")
+    connection = duckdb.connect(str(db_path), read_only=True)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute("SHOW TABLES").fetchall()
+        }
+    finally:
+        connection.close()
+
+    assert "geo_sample_qualification" in tables
+
+
+def test_cli_default_database_is_created_in_isolated_directory(
+    geo_db: Path,
+    tmp_path: Path,
+) -> None:
+    del geo_db
+    assert Path.cwd() == tmp_path
+    production_db = REPO_ROOT / "data" / "geo.duckdb"
+    before_stat = production_db.stat()
+    before_md5 = hashlib.md5(production_db.read_bytes()).hexdigest()
+
+    result = CliRunner().invoke(cli, ["check", "GSE_TRIPWIRE"])
+
+    isolated_default_db = tmp_path / "data" / "geo.duckdb"
+    assert result.exit_code != 0
+    assert isolated_default_db.exists()
+    after_stat = production_db.stat()
+    after_md5 = hashlib.md5(production_db.read_bytes()).hexdigest()
+    assert (after_stat.st_size, after_stat.st_mtime_ns, after_md5) == (
+        before_stat.st_size,
+        before_stat.st_mtime_ns,
+        before_md5,
+    )
+
+
+def test_production_database_sentinel_detects_a_new_file(tmp_path: Path) -> None:
+    absent_database = tmp_path / "data" / "geo.duckdb"
+    absent_database.parent.mkdir()
+    absent_state = None
+    absent_database.write_bytes(b"unexpected")
+
+    with pytest.raises(AssertionError, match="changed or appeared"):
+        _assert_database_unchanged(absent_database, absent_state)
