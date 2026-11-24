@@ -223,6 +223,10 @@ query report justifies it:
    higher `--max-results` (up to 10000); if `count` exceeds 10000, the
    query is incomplete by design until `retstart` pagination exists —
    state this explicitly and do not call the candidate set complete.
+   The per-query cap is hashed into the envelope scope fingerprint, so the
+   higher-cap rerun runs under a NEW `run_id` (keep the PARTIAL run's
+   directory as evidence); never rerun a different cap into the existing
+   envelope.
 3. `count: null` — completeness is unverifiable for that query; say so
    instead of estimating.
 4. `dropped_no_gse` greater than zero — report how many GEO records could
