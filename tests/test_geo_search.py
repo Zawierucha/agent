@@ -673,3 +673,69 @@ def test_cli_accepts_multiple_queries(monkeypatch: pytest.MonkeyPatch) -> None:
         max_results_per_query=100,
         timeout=30.0,
     )
+
+
+
+def test_envelope_mode_writes_search_stage_valid(tmp_path, monkeypatch) -> None:
+    import json
+
+    from click.testing import CliRunner
+    from tools.sc_dataset.geo_envelope import validate_envelope
+    from tools.sc_dataset.geo_search import main
+    monkeypatch.setattr("tools.sc_dataset.geo_search.search_geo", lambda queries, **kwargs: {"queries": [{"query": queries[0], "status": "success", "count": 0, "retrieved": 0, "error": None}], "records": [], "dropped_no_gse": 0})
+    path = tmp_path / "envelope.json"
+    result = CliRunner().invoke(main, ["--query", "alpha", "--run-id", "20261123T170500Z-3f9a1c2e", "--output-envelope", str(path), "--skill-version", "0.5.0"])
+    assert result.exit_code == 0, result.output
+    env = json.loads(path.read_text())
+    assert not [i for i in validate_envelope(env, "search") if i.severity == "ERROR"]
+    assert "E_HANDOFF_MISSING" in {i.code for i in validate_envelope(env, "handoff")}
+    assert set(json.loads(result.output)) == {"queries", "records", "dropped_no_gse", "run_id", "envelope_path"}
+
+def test_planned_not_attempted_becomes_not_run(tmp_path, monkeypatch) -> None:
+    import json
+
+    import tools.sc_dataset.geo_search as module
+    from click.testing import CliRunner
+    from tools.sc_dataset.geo_envelope import validate_envelope
+    calls = 0
+    def failing_search(queries, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"queries": [{"query": queries[0], "status": "success", "count": 1, "retrieved": 1, "error": None}], "records": [{"gse_id": "GSE1"}], "dropped_no_gse": 0}
+        raise RuntimeError("interrupted")
+    monkeypatch.setattr(module, "search_geo", failing_search)
+    path = tmp_path / "env.json"
+    result = CliRunner().invoke(module.main, ["--query", "one", "--query", "two", "--query", "three", "--output-envelope", str(path), "--run-id", "20261123T170500Z-3f9a1c2e"])
+    assert result.exit_code == 0, result.output
+    env = json.loads(path.read_text())
+    assert [q["status"] for q in env["search"]["per_query"]] == ["success", "failed", "not_run"]
+    assert env["search"]["status"] == "PARTIAL"
+    assert calls == 2
+    assert env["execution_identity"]["search_scope"]["sha256"]
+    assert not [i for i in validate_envelope(env, "search") if i.severity == "ERROR"]
+
+def test_run_id_passthrough_and_default_output_keys_unchanged(monkeypatch, tmp_path) -> None:
+    import tools.sc_dataset.geo_search as module
+    from click.testing import CliRunner
+    monkeypatch.setattr(module, "search_geo", lambda queries, **kwargs: {"queries": [], "records": [], "dropped_no_gse": 0})
+    default = CliRunner().invoke(module.main, ["--query", "q"])
+    assert default.exit_code == 0
+    assert set(__import__("json").loads(default.output)) == {"queries", "records", "dropped_no_gse"}
+    result = CliRunner().invoke(module.main, ["--query", "q", "--run-id", "20261123T170500Z-3f9a1c2e", "--output-envelope", str(tmp_path / "unused-envelope.json")])
+    assert result.exit_code == 0
+    assert __import__("json").loads(result.output)["run_id"] == "20261123T170500Z-3f9a1c2e"
+
+
+def test_envelope_scope_uses_cleaned_deduplicated_planned_queries(tmp_path, monkeypatch) -> None:
+    import json
+
+    import tools.sc_dataset.geo_search as module
+    from click.testing import CliRunner
+    monkeypatch.setattr(module, "search_geo", lambda queries, **kwargs: {"queries": [{"query": queries[0], "status": "success", "count": 0, "retrieved": 0, "error": None}], "records": [], "dropped_no_gse": 0})
+    path = tmp_path / "envelope.json"
+    result = CliRunner().invoke(module.main, ["--query", " alpha ", "--query", "alpha", "--output-envelope", str(path)])
+    assert result.exit_code == 0, result.output
+    env = json.loads(path.read_text())
+    assert [q["query"] for q in env["search"]["params"]["queries"]] == ["alpha"]
+    assert [q["query_id"] for q in env["search"]["per_query"]] == ["q1"]

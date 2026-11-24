@@ -45,6 +45,8 @@ Use the live catalog directly at:
 
 Never create a snapshot or copy unless the user explicitly requests one.
 
+For read-only inspection connect with `duckdb.connect(path, read_only=True)`. A transient `Conflicting lock is held in PID 0` means another holder briefly owns the file — wait 1–2 s and retry a few times; do not work around it with a copy. Decision columns store lowercase values (`include`/`exclude`/`uncertain`) — write filters to match; task wording may capitalize them.
+
 Before qualification, run `check GSE...` for every selected candidate. Save dataset and GSM metadata so that characteristics are normalized into `geo_sample_characteristics` and derived fields are stored in `geo_sample_metadata`. A dataset row and its GSM rows must exist before qualification.
 
 Persist the aggregate GSE decision in `geo_qualification` and a separate row for every GSM in `geo_sample_qualification`. Use `save-qualification GSE... --sample-results-file <JSON>` to store the dataset result and the complete GSM result array in one transaction. The JSON array uses `gsm_id`, `decision` (`include`, `exclude`, or `uncertain`), `tissue_source`, `disease_status`, `modality_evidence`, `evidence`, and `uncertainties`. The command rejects omitted or duplicate registered GSMs and unknown GSMs. Use `get-sample-qualifications GSE...` to verify decisions and completeness. Never infer a GSM decision from the GSE aggregate.

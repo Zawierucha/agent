@@ -1,7 +1,7 @@
 ---
 name: sc-dataset-search
 description: Search NCBI GEO for candidate human single-cell RNA-seq datasets.
-version: 0.4.1
+version: 0.5.0
 author: Piotr Zawierucha
 license: MIT
 platforms: [linux]
@@ -223,6 +223,10 @@ query report justifies it:
    higher `--max-results` (up to 10000); if `count` exceeds 10000, the
    query is incomplete by design until `retstart` pagination exists —
    state this explicitly and do not call the candidate set complete.
+   The per-query cap is hashed into the envelope scope fingerprint, so the
+   higher-cap rerun runs under a NEW `run_id` (keep the PARTIAL run's
+   directory as evidence); never rerun a different cap into the existing
+   envelope.
 3. `count: null` — completeness is unverifiable for that query; say so
    instead of estimating.
 4. `dropped_no_gse` greater than zero — report how many GEO records could
@@ -239,6 +243,12 @@ reported, not hidden. Only after the tool reports a query as failed may
 the agent substitute a logically equivalent exact-phrase query for a
 persistently failing unquoted expression; record both the original query
 and the substitution in the results summary.
+
+## Execution envelope emission
+
+The tool additionally writes a run execution envelope when `--output-envelope <path>` is set (optional `--run-id`, `--skill-version`; `TOOL_VERSION 1.1.0`): execution identity with the search-scope fingerprint, per-query accounting including `not_run` entries for planned-but-unattempted queries, derived aggregate `status` (`COMPLETE` | `PARTIAL` | `FAILED`) and `finished_at_utc`. Default stdout keeps its existing contract unchanged; the envelope file is the artifact of record.
+
+Handoff to qualification is built with `geo_envelope.py build-handoff`: every found GSE must be transferred or explicitly excluded with a control-flow reason (`already_registered`, `out_of_scope`, `duplicate_superseries`, `user_directive`, `other`) — a found candidate may never vanish between stages. Eligibility judgements belong to qualification, never to the handoff. The Stage gate below is evaluated from the envelope file, not from chat history.
 
 ## Stage gate
 

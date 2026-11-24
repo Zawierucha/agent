@@ -1,7 +1,7 @@
 ---
 name: sc-dataset-qualification
 description: Qualify human GEO single-cell and single-nucleus RNA-seq datasets for IBD research using disease, assay modality, and sample-level tissue evidence.
-version: 0.2.0
+version: 0.3.0
 author: Piotr Zawierucha
 license: MIT
 platforms:
@@ -116,6 +116,33 @@ Sample-level fields:
 The dataset decision must reflect the evidence and sample-level results. Do not assume that every sample in a series has the same eligibility.
 
 Keep the dataset decision distinct from GSM decisions. A dataset may be `include` when series metadata establishes that it is a relevant human IBD single-cell/nucleus study even if some GSMs are excluded or uncertain. Include/exclude samples individually using their metadata. Do not downgrade a biologically relevant dataset merely because its supplementary source is CSV or another non-10x format. If the series-level assay or tissue evidence is insufficient, use `uncertain` rather than guessing.
+
+## Input contract (Execution Envelope) — REQUIRED
+
+Qualification never starts from a bare GSE list, stdout notes, or conversation memory. The only valid input is a run envelope admitted by the envelope tool (contract: `docs/superpowers/specs/2026-11-23-execution-envelope-design.md`).
+
+Mandatory sequence before the first biological assessment:
+
+1. `uv run python .agents/tools/sc_dataset/geo_envelope.py validate <envelope.json> --stage handoff`
+2. `uv run python .agents/tools/sc_dataset/geo_envelope.py admit <envelope.json>` — proceed only on `ADMIT`.
+3. On anything else, record the refusal (`refuse <envelope.json> --stage qualification --status BLOCKED_* --reason "<error code + message>"`) and stop.
+
+Refusal conditions (fail-closed; every one has a validator error code):
+
+- Envelope missing, unparseable, or lacking the `search.status` field -> `BLOCKED_INVALID_ENVELOPE`. Absence of a status is never treated as success.
+- `search.status = FAILED` -> `BLOCKED_UPSTREAM`. GSE ids salvaged from a failed run are not a handoff.
+- `search.status = PARTIAL` without `allowed_to_proceed = partial_accepted` plus a complete recorded acceptance block -> `BLOCKED_UPSTREAM`.
+- Handoff reconciliation violation (found GSEs not fully accounted, duplicates, transferred/excluded overlap, foreign ids, missing exclusion reason fields, hash mismatch) -> `BLOCKED_INVALID_ENVELOPE`.
+- No handoff section at all (search-stage artifact) -> `BLOCKED_INVALID_ENVELOPE` (`E_HANDOFF_MISSING`).
+- `allowed_to_proceed = blocked` -> `BLOCKED_UPSTREAM`.
+
+Closed rationalizations — these are observed baseline failures, not hypotheticals:
+
+- "The documents do not require a status field" — this section requires it; run the validator even when the input "looks fine".
+- "The user approved it live in chat" — a live chat message is not an envelope acceptance block. Ask the orchestrator to record the acceptance in the envelope first; until then, refuse.
+- "A failed search only corrupts coverage claims, not per-dataset evidence" — assessing salvaged evidence from a failed run is forbidden; the admitted handoff alone defines the workload.
+
+Never hand-set envelope statuses: they are derived. Write your results only through `geo_envelope.py write-qualification <envelope.json> <qual.json> --skill-md <path to this SKILL.md>` (it records the criteria fingerprint incl. this file's sha256) and persist with `geo_database.py save-qualification` as before. The envelope is the execution record; DuckDB remains the catalog; qualification completeness is computed against the handoff list, not against what happens to be mentioned in the report.
 
 ## Scope boundaries
 
