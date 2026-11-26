@@ -293,9 +293,15 @@ def persist_results(db_path: Path, run_id: str, iteration: int, max_iterations: 
             """, [run_id, gsm, result["status"], result.get("adapter_name"), result.get("output_path"),
                   result.get("n_obs"), result.get("n_vars"), result.get("error_category"), result.get("error")])
 
+        history: dict[str, list[str]] = {}
+        for rel, prior in con.execute(
+            "SELECT source_relative_path, status FROM geo_anndata_import_attempts WHERE run_id=?",
+            [run_id],
+        ).fetchall():
+            history.setdefault(rel, []).append(str(prior))
         for key, meta in files_meta.items():
             candidates = [item for item in adapters_used if item["source_path"] == key]
-            statuses = [item["status"] for item in candidates]
+            statuses = history.get(meta["relative"], []) + [item["status"] for item in candidates]
             if not statuses:
                 file_status = "needs_adapter"
             elif all(status == "success" for status in statuses):

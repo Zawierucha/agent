@@ -177,7 +177,7 @@ def build_report(gse: str, manifest: dict[str, Any], inspected: dict[str, Any], 
             "Format inspection supplies hints and candidate bundles; this tool does not inspect matrix contents or create AnnData.",
             "Sample decisions are passed through from the qualification catalog; this report does not make or change biological eligibility decisions.",
             "A non-10x source requires its own format-specific reader and explicit mapping before it can share the schema.",
-            "The report embeds the exact canonical schema and its SHA-256; physical AnnData objects cannot yet be validated because this pipeline has no AnnData builder stage.",
+            "The report embeds the exact canonical schema and its SHA-256; physical .h5ad validation is performed by the ingestion stage (geo_anndata_load.py) against this contract.",
         ],
         "inputs": {
             "catalogued_sample_count": len(catalog_gsms),
