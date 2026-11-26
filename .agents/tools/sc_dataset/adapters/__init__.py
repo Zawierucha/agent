@@ -13,7 +13,7 @@ def load_adapters(adapter_dir: Path | None = None) -> tuple[list[Any], list[dict
     errors: list[dict[str, str]] = []
     root = adapter_dir or Path(__file__).resolve().parent
     for path in sorted(root.glob("*.py")):
-        if path.name in {"__init__.py", "base.py", "tenx_mtx.py"}:
+        if path.name in {"__init__.py", "base.py", "tenx_mtx.py", "common.py"}:
             continue
         module_name = f"{__name__}.{path.stem}"
         try:
@@ -23,6 +23,6 @@ def load_adapters(adapter_dir: Path | None = None) -> tuple[list[Any], list[dict
                 errors.append({"path": str(path), "error": "Module must export ADAPTER with discover() and load() methods"})
                 continue
             adapters.append(adapter)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - isolate adapter import failures
             errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
     return adapters, errors
