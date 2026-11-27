@@ -69,7 +69,7 @@ Allowed `download_status` values: `downloaded`, `already_verified`, `failed`, `n
 ## Commands
 
 Use the existing project's CLI conventions. The deterministic tool supports:
-- `--gse GSE_ID` for an explicit single-series download
+- `--gse GSE_ID` (repeatable) for explicit series selection; the count must not exceed `--limit`
 - `--limit N` to bound batch selection when GSE is omitted
 - `--dry-run` to list planned files without downloading
 - `--db PATH` to select the existing DuckDB catalog
