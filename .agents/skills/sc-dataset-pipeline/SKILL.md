@@ -20,12 +20,13 @@ GATES; domain rules live in the component skills (`sc-dataset-search`,
 The external profile skill `geo-dataset-production-pipeline` must mirror
 this file, never contradict it.
 
-## Required order (12 steps, never reorder)
+## Required order (13 steps, never reorder)
 
 1. **init run** — `python .agents/tools/sc_dataset/geo_envelope.py init-run <dir>/envelope.json --run-id <id> --query <q> [--query <q> ...]`.
 2. **search** — `python .agents/tools/sc_dataset/geo_search.py --query <q> --output-envelope <dir>/envelope.json --run-id <id>` (exit 0; per-query statuses recorded in the envelope).
 3. **build handoff** — `python .agents/tools/sc_dataset/geo_envelope.py build-handoff <dir>/envelope.json <handoff.json>` (handoff JSON carries transferred/excluded/allowed_to_proceed/acceptance); every found GSE
-   is transferred or excluded with a reason (V-1..V-7 enforced, exit 1).
+   is transferred or excluded with a reason (V-1..V-7 enforced, exit 1). Check GEO `!Series_relation` SuperSeries/SubSeries links first: with the single-owner `gsm_id` catalog, transfer the SubSeries members and
+   exclude the SuperSeries as `duplicate_superseries` (GEO semantics), unless coverage math forces the inverse — then state it.
 4. **validate/admission** — `python .agents/tools/sc_dataset/geo_envelope.py validate <dir>/envelope.json --stage handoff`, then `python .agents/tools/sc_dataset/geo_envelope.py admit <dir>/envelope.json` (exit 0 only on ADMIT). Never proceed on
    BLOCKED_UPSTREAM or BLOCKED_INVALID_ENVELOPE.
 5. **qualification** — per `sc-dataset-qualification` against transferred
@@ -43,17 +44,23 @@ this file, never contradict it.
    Writes without `--preflight` are refused BEFORE touching the DB.
 9. **verify registration** — `python .agents/tools/sc_dataset/geo_metadata.py verify-registration <dir> <GSE> --db <db> --run-id <id>`; exit 0 only on full set/feature agreement;
    it appends the `registered` event (`registration-v1` payload).
-10. **registered** — assert every transferred GSE (in a run that declares
+10. **qualification review** — per `sc-dataset-qualification-review`: ensure-schema,
+    DB backup, then `geo_review.py save-review` (dry-run first) against the persisted
+    first-pass decisions; `validate` + `report`. Review is append-only; the first-pass
+    rows are never modified. Runs only after step 8/9 `save-qualification` exists — the
+    tool refuses `qualification_missing` otherwise. Seal does not depend on review
+    presence, but a production run that skips review must state so in the report.
+11. **registered** — assert every transferred GSE (in a run that declares
     `qualification.persistence`) has a latest-status `registered` event with
     matching run_id and GSM set; `failed`/`deferred` after `registered` is
     blocking.
-11. **derive outcome** — exactly one of: SUCCESS, EMPTY_COMPLETE,
+12. **derive outcome** — exactly one of: SUCCESS, EMPTY_COMPLETE,
     NO_CANDIDATES, ALL_EXCLUDED, PARTIAL_SUCCESS, FAILURE (machine-derived,
     never declared).
-12. **seal** — `python .agents/tools/sc_dataset/geo_envelope.py seal <dir>/envelope.json` (exit 0 = immutable envelope + derived outcome; any validation issue exits 1 and the file bytes stay unchanged). A run whose admission was BLOCKED never reaches seal: record `python .agents/tools/sc_dataset/geo_envelope.py refuse <dir>/envelope.json --stage qualification --status BLOCKED_UPSTREAM --reason <r>`, outcome FAILURE stays derived from the file, the envelope remains unsealed (seal fail-closes with E_HANDOFF_MISSING).
+13. **seal** — `python .agents/tools/sc_dataset/geo_envelope.py seal <dir>/envelope.json` (exit 0 = immutable envelope + derived outcome; any validation issue exits 1 and the file bytes stay unchanged). A run whose admission was BLOCKED never reaches seal: record `python .agents/tools/sc_dataset/geo_envelope.py refuse <dir>/envelope.json --stage qualification --status BLOCKED_UPSTREAM --reason <r>`, outcome FAILURE stays derived from the file, the envelope remains unsealed (seal fail-closes with E_HANDOFF_MISSING).
 
 ## Hard prohibitions
-
+- Never rewrite first-pass qualification rows from the review stage; review is append-only (`geo_review_decisions`).
 - Never write `/workspace/data/geo.duckdb` outside an explicitly approved
   production run; tests use temp DBs only.
 - Never reorder steps 7–9; the grant (not the preflight invocation) is the
