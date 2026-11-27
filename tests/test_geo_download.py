@@ -150,6 +150,29 @@ def test_download_one_removes_partial_file_after_failure(tmp_path: Path, monkeyp
     assert not (tmp_path / ".x.txt.part").exists()
 
 
+def test_download_one_refuses_mismatched_existing_file(tmp_path: Path) -> None:
+    """Resume safety: an existing file whose size contradicts the previous manifest is
+    reported, not silently reused or overwritten (skill Download behavior #8)."""
+    target_dir = tmp_path / "supplementary"; target_dir.mkdir()
+    (target_dir / "a.csv.gz").write_bytes(b"short")
+    item = {"filename": "a.csv.gz", "source_url": "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE1nnn/GSE1/suppl/a.csv.gz", "listed_size_bytes": 99}
+    recorded = {"source_url": item["source_url"], "size_bytes": 99, "sha256": "0"*64}
+    out = downloader.download_one(item, target_dir, timeout=5, retries=0, recorded=recorded)
+    assert out["download_status"] == "not_downloaded"
+    assert "does not match the previous manifest" in (out["error"] or "")
+    assert (target_dir / "a.csv.gz").read_bytes() == b"short"
+
+
+def test_download_one_reuses_consistent_existing_file(tmp_path: Path) -> None:
+    target_dir = tmp_path / "supplementary"; target_dir.mkdir()
+    f = target_dir / "a.csv.gz"; f.write_bytes(b"same")
+    sha = downloader.sha256_file(f)
+    item = {"filename": "a.csv.gz", "source_url": "https://x/a.csv.gz", "listed_size_bytes": 4}
+    out = downloader.download_one(item, target_dir, timeout=5, retries=0,
+        recorded={"source_url": item["source_url"], "size_bytes": 4, "sha256": sha})
+    assert out["download_status"] == "already_verified" and out["error"] is None
+
+
 def test_run_gse_dry_run_writes_no_manifest_or_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db = tmp_path / "catalog.duckdb"
     create_catalog(db)

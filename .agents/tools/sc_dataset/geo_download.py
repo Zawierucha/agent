@@ -175,7 +175,8 @@ def safe_filename(name: str) -> str:
     return name
 
 
-def download_one(item: dict[str, Any], target_dir: Path, timeout: float, retries: int) -> dict[str, Any]:
+def download_one(item: dict[str, Any], target_dir: Path, timeout: float, retries: int,
+                 recorded: dict[str, Any] | None = None) -> dict[str, Any]:
     filename = safe_filename(item["filename"])
     target = target_dir / filename
     part = target_dir / f".{filename}.part"
@@ -193,6 +194,14 @@ def download_one(item: dict[str, Any], target_dir: Path, timeout: float, retries
     if target.exists() and target.is_file():
         result["size_bytes"] = target.stat().st_size
         result["sha256"] = sha256_file(target)
+        if recorded and (
+            recorded.get("source_url") != item["source_url"]
+            or (recorded.get("size_bytes") is not None and int(recorded["size_bytes"]) != result["size_bytes"])
+            or (recorded.get("sha256") and recorded["sha256"] != result["sha256"])
+        ):
+            result["error"] = ("Existing local file does not match the previous manifest "
+                               "(url/size/checksum); refusing silent reuse without destructive overwrite")
+            return result
         result["download_status"] = "already_verified"
         return result
     for attempt in range(1, retries + 2):
@@ -243,6 +252,12 @@ def run_gse(db_path: Path, root: Path, gse_id: str, timeout: float,
     records = []
     eligible_ids = set(snapshot["eligible_gsm_ids"])
     sample_decisions = snapshot["sample_qualifications"]
+    previous: dict[str, dict[str, Any]] = {}
+    if download and manifest_path.is_file():
+        try:
+            previous = {rec.get("filename", ""): rec for rec in json.loads(manifest_path.read_text()).get("files", [])}
+        except (ValueError, OSError):
+            previous = {}
     if download:
         supplementary_dir.mkdir(parents=True, exist_ok=True)
     for item in source_files:
@@ -263,7 +278,7 @@ def run_gse(db_path: Path, root: Path, gse_id: str, timeout: float,
                 "gsm_ids": sorted(explicit_gsms),
             })
         elif download:
-            records.append(download_one(item, supplementary_dir, timeout, retries))
+            records.append(download_one(item, supplementary_dir, timeout, retries, recorded=previous.get(item["filename"])))
             records[-1]["gsm_mapping_status"] = "explicit_gsm_mapping" if explicitly_mapped else "series_level_or_unknown"
             records[-1]["gsm_ids"] = sorted(explicit_gsms) if explicitly_mapped else []
         else:
