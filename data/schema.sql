@@ -141,3 +141,19 @@ CREATE TABLE IF NOT EXISTS geo_anndata_import_samples (
     FOREIGN KEY (run_id) REFERENCES geo_anndata_import_runs(run_id),
     FOREIGN KEY (gsm_id) REFERENCES geo_samples(gsm_id)
 );
+
+
+CREATE TABLE IF NOT EXISTS geo_review_runs (
+  review_run_id VARCHAR PRIMARY KEY, source_run_id VARCHAR, reviewer VARCHAR,
+  reviewer_skill_sha256 VARCHAR, started_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP, notes VARCHAR);
+CREATE TABLE IF NOT EXISTS geo_review_decisions (
+  review_run_id VARCHAR NOT NULL REFERENCES geo_review_runs(review_run_id),
+  level VARCHAR NOT NULL CHECK (level IN ('gse','gsm')),
+  gse_id VARCHAR NOT NULL REFERENCES geo_datasets(gse_id),
+  gsm_id VARCHAR,
+  accession VARCHAR NOT NULL,
+  original_status VARCHAR NOT NULL, reviewed_status VARCHAR NOT NULL CHECK (reviewed_status IN ('include','exclude','uncertain')),
+  changed BOOLEAN NOT NULL, reason VARCHAR NOT NULL, sources VARCHAR NOT NULL,
+  evidence_quality VARCHAR, missing_info VARCHAR,
+  created_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (review_run_id, level, accession));

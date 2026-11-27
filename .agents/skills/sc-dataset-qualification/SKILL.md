@@ -1,7 +1,7 @@
 ---
 name: sc-dataset-qualification
 description: Qualify human GEO single-cell and single-nucleus RNA-seq datasets for IBD research using disease, assay modality, and sample-level tissue evidence.
-version: 0.3.0
+version: 0.4.0
 author: Piotr Zawierucha
 license: MIT
 platforms:
@@ -51,6 +51,31 @@ Use sample-level evidence to distinguish affected samples, unaffected tissue, an
 - ADT-only, protein-only, and TCR/VDJ-only data do not qualify as RNA-expression assays.
 - For multimodal datasets, assess each sample or assay separately when the evidence permits.
 - Use series-level assay descriptions when sample-level modality evidence is unavailable, and record this limitation.
+
+### Evidence fields to read (v0.4.0, from confirmed review regressions)
+
+- Site evidence lives in ANY of: `tissue`, `site`, `sampling location`,
+  `location`, `region`, `organ`, plus `source_name` and GSM title. Reading only
+  `tissue` loses rectum/sigmoid evidence (regression: GSE282122, GSE150516).
+- Normalize submitted-value noise before matching: character-spaced duplicates
+  (`C o l o n  Colon`) and underscore variants (`ascending_colon`,
+  `terminal_ileum`) are the same evidence (regression: GSE266616, GSE152321).
+- Anatomy-noun precedence: `colonic mesenteric lymph nodes` is lymph-node
+  tissue (non-colonic); a modifier never upgrades the organ (regression: GSE284775).
+- Library-type tokens: `scBCR`/`scTCR`/VDJ-named libraries are repertoire
+  assays, not expression assays; `Xenium`/`CosMx`/`GeoMx`/`Visium` are spatial
+  even when titled `single-cell`; `RNA-seq of total RNA` without any
+  single-cell token is bulk (regressions: GSE230568, GSE330953/282123/282124,
+  GSE289072/266208).
+- Provenance of material: iPSC/hPSC-derived organoids, immortalized cell lines
+  and humanized-mouse xenografts are not established patient colon tissue;
+  they do not meet the tissue criterion on their own -> `uncertain` with a
+  criteria-gap note rather than silent include/exclude.
+- Non-colonic vocabulary that must NOT fall through to uncertain when it is
+  the stated tissue: blood/PBMC, tonsil, appendix, mesentery/mesenteric
+  adipose (creeping fat), small intestine/ileum/jejunum, brain/retinal,
+  dental/SHED, synovial, umbilical/MSC, stool (regressions: GSE240441,
+  GSE284191, GSE247264, GSE273276, GSE309355).
 
 ### Tissue source
 
@@ -143,6 +168,12 @@ Closed rationalizations — these are observed baseline failures, not hypothetic
 - "A failed search only corrupts coverage claims, not per-dataset evidence" — assessing salvaged evidence from a failed run is forbidden; the admitted handoff alone defines the workload.
 
 Never hand-set envelope statuses: they are derived. Write your results only through `geo_envelope.py write-qualification <envelope.json> <qual.json> --skill-md <path to this SKILL.md>` (it records the criteria fingerprint incl. this file's sha256) and persist with `geo_database.py save-qualification` as before. The envelope is the execution record; DuckDB remains the catalog; qualification completeness is computed against the handoff list, not against what happens to be mentioned in the report.
+
+## Companion stage
+
+`sc-dataset-qualification-review` re-examines this stage's output with
+independent evidence; do not pre-emptively widen or loosen biological criteria
+here to match review outcomes — criteria changes require user approval.
 
 ## Scope boundaries
 
